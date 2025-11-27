@@ -1,4 +1,3 @@
-
 import requests
 import pandas as pd
 import os
@@ -23,7 +22,6 @@ def get_xauusd_data(interval: str = "5min", outputsize: int = 200) -> pd.DataFra
         raise Exception(f"TwelveData error: {r}")
 
     df = pd.DataFrame(r["values"])
-    # TwelveData returns newest first; reverse to oldest -> newest
     df = df.iloc[::-1].reset_index(drop=True)
 
     for col in ["open", "high", "low", "close"]:
