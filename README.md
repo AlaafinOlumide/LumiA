@@ -1,5 +1,4 @@
-
-# XAUUSD Signal Bot (Render + TwelveData + TradingView + Telegram)
+# XAUUSD Signal Bot (Render + TwelveData + Telegram)
 
 This bot:
 
@@ -7,42 +6,20 @@ This bot:
 - Fetches OHLC data from **TwelveData**
 - Computes Bollinger Bands, RSI, Stochastic, ATR
 - Detects **Reversal** and **Breakout** setups
-- Confirms setups using a **TradingView webhook**
+- Enforces:
+  - Checks only on exact times x:00, x:05, x:10, ..., x:55 (UTC)
+  - Cooldown between signals
+  - No duplicate signal for the same setup until it resets
 - Sends formatted signals to **Telegram**
-- Runs on **Render** as a single web service
+- Runs on **Render** as a single web service (FastAPI healthcheck + background bot loop)
 
 ## Environment Variables (Render)
-
-Set these in Render's Dashboard:
 
 - `TWELVEDATA_API_KEY` – your TwelveData API key
 - `TELEGRAM_BOT_TOKEN` – Telegram bot token from BotFather
 - `TELEGRAM_CHAT_ID` – Chat ID (user or group) for signals
 
-Render automatically provides `PORT` for the web process.
-
-## Start Commands
+## Commands
 
 - Build: `pip install -r requirements.txt`
 - Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-
-## TradingView Setup
-
-1. Copy `tradingview_xauusd_signal_confirmer.pine` into TradingView Pine Editor.
-2. Save and add it to the **XAUUSD 5m** chart.
-3. Create an Alert:
-   - Condition: **Any alert() function call**
-   - Webhook URL: `https://YOUR-RENDER-URL.onrender.com/tv-webhook`
-   - Message: leave empty (script provides JSON).
-
-The JSON looks like:
-
-```json
-{"symbol":"XAUUSD","direction":"BUY","mode":"Reversal"}
-```
-
-The bot will only send a Telegram signal if:
-
-- Its own logic finds a setup, AND
-- A matching TradingView webhook (same symbol/direction/mode) was received in the last 10 minutes, AND
-- Cooldown and non-duplicate conditions are satisfied.
