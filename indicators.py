@@ -1,4 +1,3 @@
-
 import pandas as pd
 
 def bollinger_bands(df: pd.DataFrame, period: int = 20, std_dev: float = 2.0) -> pd.DataFrame:
