@@ -1,4 +1,3 @@
-
 from typing import Dict
 
 def format_signal(pair: str, tf: str, last, sig: Dict) -> str | None:
