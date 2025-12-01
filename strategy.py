@@ -10,11 +10,11 @@ def analyze(df: pd.DataFrame) -> Dict:
         "confirmations": int
     }
 
-    This version is more "relaxed":
-    - RSI thresholds widened (35 / 65 instead of 30 / 70)
-    - Reversal needs only 2 confirmations (was 3)
-    - Breakout does not require a Bollinger squeeze, only a solid close outside band.
+    This version is more conservative than the last one:
+    - Reversal requires rejection (close back inside band)
+    - Breakout requires proper break (prev inside, current strong close outside)
     """
+
     if len(df) < 30:
         return {"mode": None, "direction": None, "confirmations": 0}
 
@@ -23,23 +23,22 @@ def analyze(df: pd.DataFrame) -> Dict:
 
     sig = {"mode": None, "direction": None, "confirmations": 0}
 
-    # -----------------------
-    # 1) REVERSAL SETUPS
-    # -----------------------
+    # ------------- 1) REVERSAL SETUPS (BOUNCE) -------------
 
-    # BUY reversal at lower band
-    if last.close <= last.BB_LOWER:
+    # BUY reversal at lower band:
+    # - prev candle: at/under lower band
+    # - last candle: closes back ABOVE lower band (rejection)
+    if prev.close <= prev.BB_LOWER and last.close > last.BB_LOWER:
         sig["mode"] = "Reversal"
 
-        # RSI oversold but relaxed
-        if last.RSI < 35:
+        # RSI oversold (stricter again)
+        if last.RSI < 30:
             sig["confirmations"] += 1
 
-        # Stochastic bullish behaviour:
-        # either a crossover OR K rising from low area
+        # Stoch bullish behaviour (crossover or clear upturn from low)
         if (
-            (prev["%K"] < 25 and last["%K"] > last["%D"])  # classic crossover from low
-            or (last["%K"] > prev["%K"] and last["%K"] < 40)  # K turning up from low region
+            (prev["%K"] < 20 and last["%K"] > last["%D"])  # crossover from oversold
+            or (last["%K"] > prev["%K"] and last["%K"] < 40)  # rising from low area
         ):
             sig["confirmations"] += 1
 
@@ -47,79 +46,92 @@ def analyze(df: pd.DataFrame) -> Dict:
         if last.close > last.open:
             sig["confirmations"] += 1
 
-        # 🔥 Only 2 confirmations needed now (was 3)
+        # At least 2 confirmations
         if sig["confirmations"] >= 2:
             sig["direction"] = "BUY"
 
-    # SELL reversal at upper band
-    elif last.close >= last.BB_UPPER:
+    # SELL reversal at upper band:
+    # - prev candle: at/above upper band
+    # - last candle: closes back BELOW upper band
+    elif prev.close >= prev.BB_UPPER and last.close < last.BB_UPPER:
         sig["mode"] = "Reversal"
 
-        # RSI overbought but relaxed
-        if last.RSI > 65:
+        # RSI overbought
+        if last.RSI > 70:
             sig["confirmations"] += 1
 
-        # Stochastic bearish behaviour:
+        # Stoch bearish behaviour
         if (
-            (prev["%K"] > 75 and last["%K"] < last["%D"])  # classic cross down from high
-            or (last["%K"] < prev["%K"] and last["%K"] > 60)  # K turning down from high region
+            (prev["%K"] > 80 and last["%K"] < last["%D"])  # cross down from overbought
+            or (last["%K"] < prev["%K"] and last["%K"] > 60)  # turning down from high
         ):
             sig["confirmations"] += 1
 
-        # Bearish candle body
+        # Bearish candle
         if last.close < last.open:
             sig["confirmations"] += 1
 
         if sig["confirmations"] >= 2:
             sig["direction"] = "SELL"
 
-    # -----------------------
-    # 2) BREAKOUT SETUPS
-    # -----------------------
-    # Only check breakout if NO reversal already triggered
+    # ------------- 2) BREAKOUT SETUPS -------------
+
+    # Only consider breakouts if no reversal already triggered
     if sig["direction"] is None:
-        # Simple breakout:
-        # - Close beyond band
-        # - RSI in direction of move (momentum)
-        # We count confirmations to keep a similar interface.
         b_sig = {"mode": None, "direction": None, "confirmations": 0}
 
-        # BUY breakout above upper band
-        if last.close > last.BB_UPPER:
+        # Helpers
+        atr = float(last.ATR) if not pd.isna(last.ATR) else 0.0
+        body = abs(last.close - last.open)
+
+        # BUY breakout:
+        # - prev close inside band
+        # - last close clearly above upper band
+        # - body >= 0.5 * ATR (so it's not a tiny poke)
+        if (
+            prev.close <= prev.BB_UPPER
+            and prev.close >= prev.BB_LOWER
+            and last.close > last.BB_UPPER
+        ):
             b_sig["mode"] = "Breakout"
 
-            # Price clearly outside band
+            # 1) price outside band
             b_sig["confirmations"] += 1
 
-            # RSI showing bullish momentum
-            if last.RSI > 55:
+            # 2) strong body relative to ATR
+            if atr > 0 and body >= 0.5 * atr:
                 b_sig["confirmations"] += 1
 
-            # Optional: Stoch rising
-            if last["%K"] > last["%D"]:
+            # 3) RSI bullish momentum
+            if last.RSI > 60:
                 b_sig["confirmations"] += 1
 
             if b_sig["confirmations"] >= 2:
                 b_sig["direction"] = "BUY"
 
-        # SELL breakout below lower band
-        elif last.close < last.BB_LOWER:
+        # SELL breakout:
+        # - prev close inside band
+        # - last close clearly below lower band
+        # - body >= 0.5 * ATR
+        elif (
+            prev.close >= prev.BB_LOWER
+            and prev.close <= prev.BB_UPPER
+            and last.close < last.BB_LOWER
+        ):
             b_sig["mode"] = "Breakout"
 
             b_sig["confirmations"] += 1
 
-            # RSI showing bearish momentum
-            if last.RSI < 45:
+            if atr > 0 and body >= 0.5 * atr:
                 b_sig["confirmations"] += 1
 
-            # Optional: Stoch falling
-            if last["%K"] < last["%D"]:
+            if last.RSI < 40:
                 b_sig["confirmations"] += 1
 
             if b_sig["confirmations"] >= 2:
                 b_sig["direction"] = "SELL"
 
-        # If breakout signal exists, override sig
+        # If we found a breakout signal, override reversals
         if b_sig.get("direction"):
             sig = b_sig
 
