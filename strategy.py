@@ -3,56 +3,53 @@ import pandas as pd
 
 def analyze(df: pd.DataFrame) -> Dict:
     """
-    Return a signal dict:
+    Detect only strong BOUNCE (reversal) or BREAKOUT patterns.
+
+    Returns:
     {
         "mode": "Reversal" | "Breakout" | None,
         "direction": "BUY" | "SELL" | None,
         "confirmations": int
     }
-
-    This version is more conservative than the last one:
-    - Reversal requires rejection (close back inside band)
-    - Breakout requires proper break (prev inside, current strong close outside)
     """
 
     if len(df) < 30:
         return {"mode": None, "direction": None, "confirmations": 0}
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    last = df.iloc[-1]   # current closed candle
+    prev = df.iloc[-2]   # previous candle
 
     sig = {"mode": None, "direction": None, "confirmations": 0}
 
-    # ------------- 1) REVERSAL SETUPS (BOUNCE) -------------
+    # ------------- 1) BOUNCE / REVERSAL SETUPS -------------
 
-    # BUY reversal at lower band:
-    # - prev candle: at/under lower band
-    # - last candle: closes back ABOVE lower band (rejection)
+    # BUY bounce (reversal up) at lower band:
+    # - previous candle closed at/under lower band
+    # - current candle closes back above lower band (rejection)
     if prev.close <= prev.BB_LOWER and last.close > last.BB_LOWER:
         sig["mode"] = "Reversal"
 
-        # RSI oversold (stricter again)
+        # RSI oversold
         if last.RSI < 30:
             sig["confirmations"] += 1
 
-        # Stoch bullish behaviour (crossover or clear upturn from low)
+        # Stoch bullish behaviour
         if (
-            (prev["%K"] < 20 and last["%K"] > last["%D"])  # crossover from oversold
-            or (last["%K"] > prev["%K"] and last["%K"] < 40)  # rising from low area
+            (prev["%K"] < 20 and last["%K"] > last["%D"])  # crossover from low
+            or (last["%K"] > prev["%K"] and last["%K"] < 40)  # turning up from low
         ):
             sig["confirmations"] += 1
 
-        # Bullish candle body
+        # Bullish candle
         if last.close > last.open:
             sig["confirmations"] += 1
 
-        # At least 2 confirmations
         if sig["confirmations"] >= 2:
             sig["direction"] = "BUY"
 
-    # SELL reversal at upper band:
-    # - prev candle: at/above upper band
-    # - last candle: closes back BELOW upper band
+    # SELL bounce (reversal down) at upper band:
+    # - previous candle closed at/above upper band
+    # - current candle closes back below upper band
     elif prev.close >= prev.BB_UPPER and last.close < last.BB_UPPER:
         sig["mode"] = "Reversal"
 
@@ -62,8 +59,8 @@ def analyze(df: pd.DataFrame) -> Dict:
 
         # Stoch bearish behaviour
         if (
-            (prev["%K"] > 80 and last["%K"] < last["%D"])  # cross down from overbought
-            or (last["%K"] < prev["%K"] and last["%K"] > 60)  # turning down from high
+            (prev["%K"] > 80 and last["%K"] < last["%D"])  # cross down from high
+            or (last["%K"] < prev["%K"] and last["%K"] > 60)  # rolling over
         ):
             sig["confirmations"] += 1
 
@@ -76,18 +73,17 @@ def analyze(df: pd.DataFrame) -> Dict:
 
     # ------------- 2) BREAKOUT SETUPS -------------
 
-    # Only consider breakouts if no reversal already triggered
+    # Only look for breakout if no reversal already chosen
     if sig["direction"] is None:
         b_sig = {"mode": None, "direction": None, "confirmations": 0}
 
-        # Helpers
         atr = float(last.ATR) if not pd.isna(last.ATR) else 0.0
         body = abs(last.close - last.open)
 
         # BUY breakout:
-        # - prev close inside band
-        # - last close clearly above upper band
-        # - body >= 0.5 * ATR (so it's not a tiny poke)
+        # - previous close inside bands
+        # - current close above upper band
+        # - body >= 0.5 * ATR
         if (
             prev.close <= prev.BB_UPPER
             and prev.close >= prev.BB_LOWER
@@ -95,14 +91,14 @@ def analyze(df: pd.DataFrame) -> Dict:
         ):
             b_sig["mode"] = "Breakout"
 
-            # 1) price outside band
+            # price outside band
             b_sig["confirmations"] += 1
 
-            # 2) strong body relative to ATR
+            # decent body size
             if atr > 0 and body >= 0.5 * atr:
                 b_sig["confirmations"] += 1
 
-            # 3) RSI bullish momentum
+            # RSI bullish momentum
             if last.RSI > 60:
                 b_sig["confirmations"] += 1
 
@@ -110,8 +106,8 @@ def analyze(df: pd.DataFrame) -> Dict:
                 b_sig["direction"] = "BUY"
 
         # SELL breakout:
-        # - prev close inside band
-        # - last close clearly below lower band
+        # - previous close inside bands
+        # - current close below lower band
         # - body >= 0.5 * ATR
         elif (
             prev.close >= prev.BB_LOWER
@@ -131,7 +127,6 @@ def analyze(df: pd.DataFrame) -> Dict:
             if b_sig["confirmations"] >= 2:
                 b_sig["direction"] = "SELL"
 
-        # If we found a breakout signal, override reversals
         if b_sig.get("direction"):
             sig = b_sig
 
