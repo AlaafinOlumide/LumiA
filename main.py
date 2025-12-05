@@ -19,11 +19,11 @@ PAIR = "XAUUSD"
 TF_LABEL = "5M"
 
 INTERVAL_5M = "5min"
-INTERVAL_1H = "1h"
 
-COOLDOWN_MINUTES = 5        # min time between any two signals
-RANGE_ATR_MULT = 0.5        # how close to EMA50(1H) counts as "range"
-ADX_TREND_THRESHOLD = 20.0  # ADX(1H) above this => trending
+SLEEP_SECONDS = 120          # 🔹 1 API call every 2 minutes ≈ 720 calls/day
+COOLDOWN_MINUTES = 5         # min time between any two signals
+RANGE_ATR_MULT = 0.5         # how close to EMA50(1H) counts as "range"
+ADX_TREND_THRESHOLD = 20.0   # ADX(1H) above this => trending
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -73,11 +73,11 @@ def send_telegram_message(text: str):
         print("Telegram exception:", e)
 
 
-def detect_trend_1h() -> dict:
+def compute_1h_regime_from_5m(df_5m: pd.DataFrame) -> dict:
     """
-    Determine 1H regime using EMA50, ATR14, and ADX14.
+    Build 1H candles from 5M data and determine regime using EMA50, ATR14, ADX14.
 
-    Returns dict:
+    Returns:
       {
         "regime": "BULL" | "BEAR" | "RANGE",
         "ema": float,
@@ -86,24 +86,39 @@ def detect_trend_1h() -> dict:
         "close": float
       }
     """
-
     global last_trend_1h
 
-    df_1h = get_xauusd_data(interval=INTERVAL_1H, outputsize=200)
+    # Ensure datetime index
+    tmp = df_5m.copy()
+    if "datetime" in tmp.columns:
+        tmp["datetime"] = pd.to_datetime(tmp["datetime"])
+        tmp = tmp.set_index("datetime")
+    else:
+        tmp.index = pd.to_datetime(tmp.index)
+
+    # Resample to 1H OHLC
+    ohlc_1h = tmp.resample("1H").agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+        }
+    ).dropna()
 
     # EMA50 on close
-    df_1h["EMA50"] = df_1h["close"].ewm(span=50, adjust=False).mean()
+    ohlc_1h["EMA50"] = ohlc_1h["close"].ewm(span=50, adjust=False).mean()
 
     # ATR(14) on 1H
-    high_low = df_1h["high"] - df_1h["low"]
-    high_close = (df_1h["high"] - df_1h["close"].shift()).abs()
-    low_close = (df_1h["low"] - df_1h["close"].shift()).abs()
+    high_low = ohlc_1h["high"] - ohlc_1h["low"]
+    high_close = (ohlc_1h["high"] - ohlc_1h["close"].shift()).abs()
+    low_close = (ohlc_1h["low"] - ohlc_1h["close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df_1h["ATR"] = tr.rolling(14).mean()
+    ohlc_1h["ATR"] = tr.rolling(14).mean()
 
     # ADX(14) approx on 1H
-    high_diff = df_1h["high"].diff()
-    low_diff = df_1h["low"].diff()
+    high_diff = ohlc_1h["high"].diff()
+    low_diff = ohlc_1h["low"].diff()
 
     plus_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0.0)
     minus_dm = (-low_diff).where((low_diff > high_diff) & (low_diff < 0), 0.0)
@@ -116,9 +131,9 @@ def detect_trend_1h() -> dict:
     minus_di = 100 * (minus_dm14 / tr14)
 
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    df_1h["ADX"] = dx.rolling(14).mean()
+    ohlc_1h["ADX"] = dx.rolling(14).mean()
 
-    last_row = df_1h.iloc[-1]
+    last_row = ohlc_1h.iloc[-1]
 
     ema = float(last_row["EMA50"])
     atr = float(last_row["ATR"]) if not pd.isna(last_row["ATR"]) else 0.0
@@ -155,21 +170,13 @@ def bot_loop():
 
     while True:
         try:
-            # Poll every ~30 seconds; only act on new closed 5m candles
-            time.sleep(30)
-
+            # 🔁 One iteration every SLEEP_SECONDS
+            time.sleep(SLEEP_SECONDS)
             now = datetime.now(timezone.utc)
 
-            # 1️⃣ Higher timeframe regime (1H)
-            ht = detect_trend_1h()
-            regime = ht["regime"]   # "BULL", "BEAR", "RANGE"
-
-            # 2️⃣ Get 5m data & indicators
-            df_5m = get_xauusd_data(interval=INTERVAL_5M, outputsize=200)
-            df_5m = bollinger_bands(df_5m)
-            df_5m = rsi(df_5m)
-            df_5m = stochastic(df_5m)
-            df_5m = atr(df_5m)
+            # 1️⃣ Get 5m data ONCE (used for both regime & signals)
+            df_5m = get_xauusd_data(interval=INTERVAL_5M, outputsize=300)
+            df_5m = df_5m.sort_values("datetime") if "datetime" in df_5m.columns else df_5m.sort_index()
 
             # Identify last closed 5m candle
             if "datetime" in df_5m.columns:
@@ -183,7 +190,16 @@ def bot_loop():
 
             last_candle_id_5m = candle_id
 
-            # 3️⃣ Run 5m bounce/breakout strategy
+            # 2️⃣ Compute higher timeframe regime from 5m data
+            ht = compute_1h_regime_from_5m(df_5m)
+            regime = ht["regime"]   # "BULL", "BEAR", "RANGE"
+
+            # 3️⃣ Compute 5m indicators & run strategy
+            df_5m = bollinger_bands(df_5m)
+            df_5m = rsi(df_5m)
+            df_5m = stochastic(df_5m)
+            df_5m = atr(df_5m)
+
             sig = analyze(df_5m)
             current_setup = get_setup_id(sig)
             direction = sig.get("direction")   # "BUY" or "SELL"
@@ -225,7 +241,7 @@ def bot_loop():
 
             if base_text:
                 ht_line = (
-                    f"Higher timeframe (1H): {regime}\n"
+                    f"Higher timeframe (1H from 5M): {regime}\n"
                     f"ADX: {ht['adx']:.2f} | EMA50: {ht['ema']:.2f} | Price: {ht['close']:.2f}"
                 )
                 full_text = f"{base_text}\n\n{ht_line}"
@@ -241,8 +257,15 @@ def bot_loop():
                 last_signal_ts = now
 
         except Exception as e:
-            print("Bot loop error:", e)
-            time.sleep(5)
+            msg = str(e)
+            print("Bot loop error:", msg)
+
+            # 🔴 If we hit the TwelveData daily limit (429), back off heavily
+            if "429" in msg or "run out of API credits" in msg:
+                print("Hit TwelveData daily limit. Backing off for 1 hour to avoid spamming the API.")
+                time.sleep(3600)  # sleep 1 hour
+            else:
+                time.sleep(10)    # small backoff for other errors
 
 
 # ---------------- FastAPI ----------------
@@ -251,7 +274,7 @@ def bot_loop():
 def root():
     return {
         "status": "ok",
-        "message": "XAUUSD bot running (5M bounce/breakout aligned with 1H regime: BULL/BEAR/RANGE using EMA50 + ATR + ADX)",
+        "message": "XAUUSD bot running (5M bounce/breakout aligned with 1H regime from 5M: BULL/BEAR/RANGE using EMA50 + ATR + ADX, API-safe)",
     }
 
 
