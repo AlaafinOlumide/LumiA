@@ -82,10 +82,8 @@ def wait_for_next_5min_slot():
     mins = now.minute
     secs = now.second
 
-    # minutes to add to reach next multiple of 5
     mins_to_add = (5 - (mins % 5)) % 5
     if mins_to_add == 0 and secs < 1:
-        # already aligned very near the boundary
         return
     if mins_to_add == 0:
         mins_to_add = 5
@@ -147,14 +145,17 @@ def detect_trend_1h() -> dict:
     adx = float(last_row["ADX"]) if not pd.isna(last_row["ADX"]) else 0.0
     close = float(last_row["close"])
 
-    # Decide regime
-    if atr > 0 and abs(close - ema) < RANGE_ATR_MULT * atr:
-        regime = "RANGE"
+    # ---- ADX-dominant regime logic ----
+    if adx >= ADX_TREND_THRESHOLD:
+        # Strong trend: only BULL or BEAR, no RANGE even if price hugs EMA
+        regime = "BULL" if close > ema else "BEAR"
     else:
-        if adx >= ADX_TREND_THRESHOLD:
-            regime = "BULL" if close > ema else "BEAR"
-        else:
+        # Weak/low-trend environment: allow true ranges
+        if atr > 0 and abs(close - ema) < RANGE_ATR_MULT * atr:
             regime = "RANGE"
+        else:
+            regime = "BULL" if close > ema else "BEAR"
+    # ------------------------------------
 
     if regime != last_trend_1h:
         print(f"{datetime.now(timezone.utc)} - 1H regime changed to: {regime} (ADX={adx:.2f})")
@@ -240,9 +241,15 @@ def bot_loop():
                 print(f"{now} - In cooldown, setup ignored: {current_setup}")
                 continue
 
-            # 7️⃣ All checks passed → send signal
+            # 7️⃣ All checks passed → send signal (but only if strong enough)
             last = df_5m.iloc[-1]
             base_text = format_signal(PAIR, TF_LABEL, last, sig)
+            confidence = sig.get("confidence", 0)
+
+            # Only send stronger setups
+            if confidence < 3:
+                print(f"{now} - Setup {current_setup} skipped due to low confidence ({confidence}/4)")
+                continue
 
             if base_text:
                 ht_line = (
@@ -253,8 +260,9 @@ def bot_loop():
 
                 print(
                     f"{now} - Sending signal: {current_setup} "
-                    f"(Regime: {regime}) | close={last.close:.2f} "
-                    f"RSI={last.RSI:.2f} K={last['%K']:.2f} D={last['%D']:.2f} ATR={last.ATR:.2f}"
+                    f"(Regime: {regime}, Conf: {confidence}/4) | "
+                    f"close={last.close:.2f} RSI={last.RSI:.2f} "
+                    f"K={last['%K']:.2f} D={last['%D']:.2f} ATR={last.ATR:.2f}"
                 )
 
                 send_telegram_message(full_text)
@@ -289,7 +297,7 @@ def bot_loop():
 def root():
     return {
         "status": "ok",
-        "message": "XAUUSD bot running (5M bounce/breakout aligned with 1H regime: BULL/BEAR/RANGE using EMA50 + ATR + ADX, 5m polling to respect TwelveData limits)",
+        "message": "XAUUSD bot running (5M bounce/breakout aligned with 1H regime: BULL/BEAR/RANGE using EMA50 + ATR + ADX, 5m polling, confidence>=3 only)",
     }
 
 
