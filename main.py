@@ -241,14 +241,24 @@ def bot_loop():
                 print(f"{now} - In cooldown, setup ignored: {current_setup}")
                 continue
 
-            # 7️⃣ All checks passed → send signal (but only if strong enough)
+            # 7️⃣ All checks passed → send signal, but with hybrid confidence thresholds
             last = df_5m.iloc[-1]
             base_text = format_signal(PAIR, TF_LABEL, last, sig)
             confidence = sig.get("confidence", 0)
 
-            # Only send stronger setups
-            if confidence < 3:
-                print(f"{now} - Setup {current_setup} skipped due to low confidence ({confidence}/4)")
+            # Hybrid confidence:
+            # - Breakouts require >= 3/4
+            # - Reversals require >= 2/4
+            if mode == "Breakout":
+                min_conf = 3
+            else:  # treat anything else as reversal-style
+                min_conf = 2
+
+            if confidence < min_conf:
+                print(
+                    f"{now} - Setup {current_setup} skipped due to low confidence "
+                    f"({confidence}/4, min required {min_conf}/4 for {mode})"
+                )
                 continue
 
             if base_text:
@@ -260,7 +270,7 @@ def bot_loop():
 
                 print(
                     f"{now} - Sending signal: {current_setup} "
-                    f"(Regime: {regime}, Conf: {confidence}/4) | "
+                    f"(Regime: {regime}, Conf: {confidence}/4, MinRequired={min_conf}/4) | "
                     f"close={last.close:.2f} RSI={last.RSI:.2f} "
                     f"K={last['%K']:.2f} D={last['%D']:.2f} ATR={last.ATR:.2f}"
                 )
@@ -297,7 +307,11 @@ def bot_loop():
 def root():
     return {
         "status": "ok",
-        "message": "XAUUSD bot running (5M bounce/breakout aligned with 1H regime: BULL/BEAR/RANGE using EMA50 + ATR + ADX, 5m polling, confidence>=3 only)",
+        "message": (
+            "XAUUSD bot running (5M bounce/breakout aligned with 1H regime: "
+            "BULL/BEAR/RANGE using EMA50 + ATR + ADX, 5m polling, "
+            "hybrid confidence: Breakout>=3/4, Reversal>=2/4)"
+        ),
     }
 
 
