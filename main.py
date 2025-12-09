@@ -5,7 +5,12 @@ import datetime as dt
 from config import load_settings
 from telegram_client import TelegramClient
 from data_fetcher import fetch_ohlcv
-from strategy import detect_trend_h1, confirm_trend_m15, trigger_signal_m5, is_within_sessions
+from strategy import (
+    detect_trend_h1,
+    confirm_trend_m15,
+    trigger_signal_m5,
+    is_within_sessions,
+)
 from data_logger import log_signal
 from high_impact_news import has_high_impact_news_near
 
@@ -15,13 +20,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("xauusd_bot")
 
+
 def _risk_tag_from_adx(adx_m5: float) -> str:
-    # Classify the trade idea as SCALP vs SWING based on M5 ADX strength.
+    """
+    Classify the trade idea as SCALP vs SWING based on M5 ADX strength.
+    """
     if adx_m5 >= 30:
         return "SWING"
     return "SCALP"
 
-def build_signal_message(symbol: str, signal, trend_h1, session_window: str, high_news: bool) -> str:
+
+def build_signal_message(
+    symbol: str,
+    signal,
+    trend_h1,
+    session_window: str,
+    high_news: bool,
+) -> str:
     arrow = "🟢 BUY" if signal.direction == "LONG" else "🔴 SELL"
     adx_m5 = signal.extra["adx_m5"]
     risk_tag = _risk_tag_from_adx(adx_m5)
@@ -42,10 +57,14 @@ def build_signal_message(symbol: str, signal, trend_h1, session_window: str, hig
         f"RSI(M5): `{signal.extra['m5_rsi']:.2f}`  |  "
         f"StochK(M5): `{signal.extra['m5_stoch_k']:.2f}`\n"
         f"ADX(M5): `{signal.extra['adx_m5']:.2f}` "
-        f"(+DI: `{signal.extra['plus_di_m5']:.2f}`, -DI: `{signal.extra['minus_di_m5']:.2f}`)\n"
-        f"BB(M5): upper `{signal.extra['bb_upper']:.2f}`, mid `{signal.extra['bb_mid']:.2f}`, lower `{signal.extra['bb_lower']:.2f}`"
+        f"(+DI: `{signal.extra['plus_di_m5']:.2f}`, "
+        f"-DI: `{signal.extra['minus_di_m5']:.2f}`)\n"
+        f"BB(M5): upper `{signal.extra['bb_upper']:.2f}`, "
+        f"mid `{signal.extra['bb_mid']:.2f}`, "
+        f"lower `{signal.extra['bb_lower']:.2f}`"
     )
     return text
+
 
 def main_loop():
     settings = load_settings()
@@ -99,7 +118,13 @@ def main_loop():
                 time.sleep(60)
                 continue
 
-            session_window = "08:00-10:00" if settings.session_1_start <= now_utc.hour * 100 + now_utc.minute <= settings.session_1_end else "12:00-16:00"
+            # Which session are we in?
+            hhmm = now_utc.hour * 100 + now_utc.minute
+            if settings.session_1_start <= hhmm <= settings.session_1_end:
+                session_window = "08:00-10:00"
+            else:
+                session_window = "12:00-16:00"
+
             high_news = has_high_impact_news_near(symbol, now_utc)
 
             msg = build_signal_message(symbol, signal, trend_h1, session_window, high_news)
@@ -132,6 +157,7 @@ def main_loop():
         except Exception as e:
             logger.exception("Error in main loop: %s", e)
             time.sleep(60)
+
 
 if __name__ == "__main__":
     main_loop()
