@@ -1,8 +1,0 @@
-ccxt==4.3.11
-python-telegram-bot==20.7
-pandas==2.2.0
-numpy==1.26.4
-ta==0.10.2
-python-dotenv==1.0.0
-schedule==1.2.1
-requests==2.31.0
