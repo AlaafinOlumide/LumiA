@@ -1,7 +1,9 @@
 import pandas as pd
 
+
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
+
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -11,6 +13,7 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rsi_val = 100 - (100 / (1 + rs))
     return rsi_val
 
+
 def bollinger_bands(series: pd.Series, period: int = 20, std_factor: float = 2.0):
     ma = series.rolling(window=period).mean()
     std = series.rolling(window=period).std()
@@ -18,15 +21,25 @@ def bollinger_bands(series: pd.Series, period: int = 20, std_factor: float = 2.0
     lower = ma - std_factor * std
     return upper, ma, lower
 
-def stochastic_oscillator(high: pd.Series, low: pd.Series, close: pd.Series, k_period: int = 14, d_period: int = 3):
+
+def stochastic_oscillator(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    k_period: int = 14,
+    d_period: int = 3,
+):
     lowest_low = low.rolling(window=k_period).min()
     highest_high = high.rolling(window=k_period).max()
     k = 100 * (close - lowest_low) / (highest_high - lowest_low)
     d = k.rolling(window=d_period).mean()
     return k, d
 
+
 def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
-    # Simplified ADX implementation
+    """
+    Simplified ADX implementation.
+    """
     plus_dm = high.diff()
     minus_dm = low.diff().abs() * -1
     plus_dm[plus_dm < 0] = 0
@@ -40,9 +53,10 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
     atr = tr.rolling(window=period).mean()
     plus_di = 100 * (plus_dm.rolling(window=period).sum() / atr)
     minus_di = 100 * (minus_dm.abs().rolling(window=period).sum() / atr)
-    dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di) ) * 100
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di)) * 100
     adx_series = dx.rolling(window=period).mean()
     return adx_series, plus_di, minus_di
+
 
 def bullish_engulfing(open_: pd.Series, close: pd.Series):
     prev_open = open_.shift(1)
@@ -51,6 +65,7 @@ def bullish_engulfing(open_: pd.Series, close: pd.Series):
     cond_curr_bull = close > open_
     cond_engulf = (close >= prev_open) & (open_ <= prev_close)
     return cond_prev_bear & cond_curr_bull & cond_engulf
+
 
 def bearish_engulfing(open_: pd.Series, close: pd.Series):
     prev_open = open_.shift(1)
