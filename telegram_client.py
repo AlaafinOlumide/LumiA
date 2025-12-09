@@ -22,6 +22,10 @@ class TelegramClient:
         try:
             r = requests.post(url, json=payload, timeout=10)
             if not r.ok:
-                logger.error("Failed to send Telegram message: %s - %s", r.status_code, r.text)
+                logger.error(
+                    "Failed to send Telegram message: %s - %s",
+                    r.status_code,
+                    r.text,
+                )
         except Exception as e:
             logger.exception("Error sending Telegram message: %s", e)
