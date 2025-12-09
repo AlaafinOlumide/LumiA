@@ -6,8 +6,11 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.twelvedata.com/time_series"
 
+
 def fetch_ohlcv(api_key: str, symbol: str, interval: str, outputsize: int = 150) -> pd.DataFrame:
-    # Fetch OHLCV data from Twelve Data and return as DataFrame sorted by time ascending.
+    """
+    Fetch OHLCV data from Twelve Data and return as DataFrame sorted by time ascending.
+    """
     params = {
         "symbol": symbol,
         "interval": interval,
