@@ -25,8 +25,11 @@ FIELDNAMES = [
     "high_impact_news",
 ]
 
+
 def log_signal(row: Dict[str, Any]) -> None:
-    # Append a signal row to CSV. Extra keys beyond FIELDNAMES are ignored.
+    """
+    Append a signal row to CSV. Extra keys beyond FIELDNAMES are ignored.
+    """
     exists = os.path.exists(LOG_FILE)
     with open(LOG_FILE, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
