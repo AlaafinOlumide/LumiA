@@ -57,9 +57,8 @@ def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
 
     More forgiving logic:
     - Uses EMA(50) vs EMA(200) for direction.
-    - Uses ADX(14) for strength, but only blocks when both:
-        * EMAs are flat/tangled, AND
-        * ADX is very low.
+    - Uses ADX(14) only to block when EMAs are very flat & ADX very low.
+
     Returns:
         "LONG", "SHORT", or None if genuinely directionless.
     """
@@ -192,21 +191,21 @@ def confirm_trend_m15(m15_df: pd.DataFrame, trend_h1: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# M5 TRIGGER: PULLBACKS + BREAKOUTS
+# M5 TRIGGER: PULLBACKS + MODERATE BREAKOUTS
 # ---------------------------------------------------------------------------
 
 def trigger_signal_m5(m5_df: pd.DataFrame, trend_for_signal: str) -> Optional[Signal]:
     """
     Generate a LONG/SHORT signal on M5 in the direction of the higher-timeframe bias.
 
-    Now supports TWO types of entries:
+    Supports TWO types of entries:
     - PULLBACK: price retraces to BB mid/lower (uptrend) / mid/upper (downtrend)
     - BREAKOUT: strong momentum candle through BB upper/lower in trend direction
 
-    Loosened conditions overall for more signals:
-    - ADX floor = 5
-    - Slightly wider Bollinger proximity
-    - Candle can be engulfing OR generally strong in the trend direction
+    "Moderate" breakout mode:
+    - Global ADX floor = 5 to avoid complete noise
+    - Breakout-only ADX requirement ≈ 14+
+    - Candle must close outside band in trend direction
     """
     if m5_df is None or m5_df.empty or len(m5_df) < 50:
         return None
@@ -232,6 +231,9 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_for_signal: str) -> Optional[Si
     )
     bull_engulf = bullish_engulfing(open_series, close_series)
     bear_engulf = bearish_engulfing(open_series, close_series)
+
+    # Positional previous close for breakout body check
+    prev_close = float(close_series.iloc[-3])
 
     # Values on the last completed bar
     rsi_val = float(rsi_series.loc[row_idx])
@@ -262,11 +264,11 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_for_signal: str) -> Optional[Si
         "minus_di_m5": minus_di_val,
     }
 
-    # Slightly lower ADX floor to allow more trades, but still avoid pure noise
+    # Slightly lower global ADX floor to allow more trades, but still avoid pure noise
     if adx_val < 5:
         return None
 
-    # Helper: strong candles in direction of trend
+    # Helper: strong candles in direction of trend (for pullbacks)
     is_strong_bull = (close_val > open_val) and (close_val >= bb_mid_val)
     is_strong_bear = (close_val < open_val) and (close_val <= bb_mid_val)
 
@@ -297,16 +299,20 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_for_signal: str) -> Optional[Si
                 extra=extra,
             )
 
-        # --- Breakout conditions ---
-        breakout_bb = close_val >= bb_upper_val * 0.999  # near/through upper band
-        breakout_momentum = (rsi_val >= 60) and (stoch_k_val >= 60)
-        breakout_adx_bias = plus_di_val > minus_di_val
-        breakout_candle_ok = (close_val > open_val) and (close_val >= bb_upper_val)
+        # --- Moderate breakout conditions ---
+        breakout_bb = close_val >= bb_upper_val  # close outside upper band
+        breakout_momentum = (rsi_val >= 65) and (stoch_k_val >= 60)
+        breakout_adx_bias = (plus_di_val > minus_di_val) and (adx_val >= 14)
+        breakout_candle_ok = (
+            (close_val > open_val)
+            and (close_val >= bb_upper_val)
+            and (close_val > prev_close)
+        )
 
         if breakout_bb and breakout_momentum and breakout_adx_bias and breakout_candle_ok:
             reason = (
                 "BREAKOUT LONG: M5 momentum candle through upper Bollinger band "
-                "in line with uptrend (RSI >= 60, StochK >= 60, +DI > -DI)."
+                "in line with uptrend (RSI >= 65, StochK >= 60, ADX >= 14, +DI > -DI)."
             )
             extra["setup_type"] = "BREAKOUT_LONG"
             return Signal(
@@ -344,16 +350,20 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_for_signal: str) -> Optional[Si
                 extra=extra,
             )
 
-        # --- Breakout conditions ---
-        breakout_bb = close_val <= bb_lower_val * 1.001  # near/through lower band
+        # --- Moderate breakout conditions ---
+        breakout_bb = close_val <= bb_lower_val  # close outside lower band
         breakout_momentum = (rsi_val <= 40) and (stoch_k_val <= 40)
-        breakout_adx_bias = minus_di_val > plus_di_val
-        breakout_candle_ok = (close_val < open_val) and (close_val <= bb_lower_val)
+        breakout_adx_bias = (minus_di_val > plus_di_val) and (adx_val >= 14)
+        breakout_candle_ok = (
+            (close_val < open_val)
+            and (close_val <= bb_lower_val)
+            and (close_val < prev_close)
+        )
 
         if breakout_bb and breakout_momentum and breakout_adx_bias and breakout_candle_ok:
             reason = (
                 "BREAKOUT SHORT: M5 momentum candle through lower Bollinger band "
-                "in line with downtrend (RSI <= 40, StochK <= 40, -DI > +DI)."
+                "in line with downtrend (RSI <= 40, StochK <= 40, ADX >= 14, -DI > +DI)."
             )
             extra["setup_type"] = "BREAKOUT_SHORT"
             return Signal(
