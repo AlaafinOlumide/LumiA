@@ -1,10 +1,13 @@
 import time
 import logging
 import datetime as dt
+from typing import Optional
 
-from config import load_settings
+import pandas as pd
+
+from config import load_settings, Settings
 from telegram_client import TelegramClient
-from data_fetcher import fetch_ohlcv
+from data_fetcher import fetch_m5_ohlcv_hybrid
 from strategy import (
     detect_trend_h1,
     confirm_trend_m15,
@@ -20,6 +23,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("xauusd_bot")
 
+# Fetch 5m data at most once every 120 seconds (2 minutes)
+FETCH_INTERVAL_SECONDS = 120
+
 
 def _risk_tag_from_adx(adx_m5: float) -> str:
     """
@@ -31,7 +37,7 @@ def _risk_tag_from_adx(adx_m5: float) -> str:
 
 
 def build_signal_message(
-    symbol: str,
+    symbol_label: str,
     signal,
     trend_h1,
     session_window: str,
@@ -48,7 +54,7 @@ def build_signal_message(
 
     text = (
         f"*XAUUSD Signal*  `[{risk_tag}]`\n"
-        f"{arrow}  `{symbol}` at *{signal.price:.2f}*\n"
+        f"{arrow}  `{symbol_label}` at *{signal.price:.2f}*\n"
         f"Time (UTC): `{signal.time.isoformat()}`\n"
         f"Trend (H1): *{trend_h1}*\n"
         f"Session: `{session_window}`\n"
@@ -66,17 +72,47 @@ def build_signal_message(
     return text
 
 
+def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """
+    Resample a 5m OHLCV DataFrame to a higher timeframe (15m, 1h, etc.).
+    Assumes df has columns: datetime, open, high, low, close, volume.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    tmp = df.copy()
+    tmp = tmp.set_index("datetime")
+    agg = tmp.resample(rule).agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+    )
+    agg = agg.dropna()
+    agg = agg.reset_index()
+    return agg
+
+
 def main_loop():
-    settings = load_settings()
+    settings: Settings = load_settings()
     tg = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id)
 
-    symbol = settings.xau_symbol
-    logger.info("Starting XAUUSD bot for symbol %s", symbol)
+    # For display in Telegram, we just call it XAUUSD
+    symbol_label = "XAUUSD"
+    logger.info(
+        "Starting XAUUSD bot (hybrid data: yfinance primary, Twelve Data fallback)."
+    )
 
-    last_signal_time = None
+    last_signal_time: Optional[dt.datetime] = None
+
+    # Cache for 5m data to reduce external calls
+    cached_m5_df: Optional[pd.DataFrame] = None
+    last_m5_fetch_ts: Optional[float] = None
 
     while True:
-        # Still using utcnow (warning is harmless for our use here)
         now_utc = dt.datetime.utcnow()
 
         if not is_within_sessions(
@@ -91,11 +127,43 @@ def main_loop():
             continue
 
         try:
-            logger.info("Fetching OHLCV data from Twelve Data...")
-            h1_df = fetch_ohlcv(settings.twelvedata_api_key, symbol, "1h", 150)
-            m15_df = fetch_ohlcv(settings.twelvedata_api_key, symbol, "15min", 150)
-            m5_df = fetch_ohlcv(settings.twelvedata_api_key, symbol, "5min", 150)
+            # ---------- DATA FETCH / CACHE LAYER ----------
+            now_ts = time.time()
+            should_fetch_m5 = (
+                last_m5_fetch_ts is None
+                or (now_ts - last_m5_fetch_ts) >= FETCH_INTERVAL_SECONDS
+            )
 
+            if should_fetch_m5:
+                logger.info("Fetching fresh M5 OHLCV data (hybrid: yfinance -> Twelve Data)...")
+                m5_df = fetch_m5_ohlcv_hybrid(settings)
+                cached_m5_df = m5_df
+                last_m5_fetch_ts = now_ts
+            else:
+                if cached_m5_df is None:
+                    logger.info("No cached M5 data yet, fetching hybrid source...")
+                    m5_df = fetch_m5_ohlcv_hybrid(settings)
+                    cached_m5_df = m5_df
+                    last_m5_fetch_ts = now_ts
+                else:
+                    logger.info("Using cached M5 OHLCV data.")
+                    m5_df = cached_m5_df
+
+            if m5_df is None or m5_df.empty:
+                logger.info("Empty M5 data, sleeping 60s.")
+                time.sleep(60)
+                continue
+
+            # ---------- RESAMPLING ----------
+            h1_df = resample_ohlcv(m5_df, "1H")
+            m15_df = resample_ohlcv(m5_df, "15T")
+
+            if len(h1_df) < 30 or len(m15_df) < 30 or len(m5_df) < 30:
+                logger.info("Not enough data after resampling, sleeping 60s.")
+                time.sleep(60)
+                continue
+
+            # ---------- STRATEGY PIPELINE ----------
             trend_h1 = detect_trend_h1(h1_df)
             if trend_h1 is None:
                 logger.info("No clear H1 trend, skipping.")
@@ -121,22 +189,22 @@ def main_loop():
                 time.sleep(60)
                 continue
 
-            # Session label (single big window)
+            # Session label (single big window: 07:00–20:00 UTC)
             hhmm = now_utc.hour * 100 + now_utc.minute
             if settings.session_1_start <= hhmm <= settings.session_1_end:
                 session_window = "07:00-20:00"
             else:
                 session_window = "OUTSIDE"
 
-            high_news = has_high_impact_news_near(symbol, now_utc)
+            high_news = has_high_impact_news_near(symbol_label, now_utc)
 
-            msg = build_signal_message(symbol, signal, trend_h1, session_window, high_news)
+            msg = build_signal_message(symbol_label, signal, trend_h1, session_window, high_news)
             tg.send_message(msg)
             last_signal_time = now_utc
 
             # Log with ~12+ data fields
             row = {
-                "symbol": symbol,
+                "symbol": symbol_label,
                 "direction": signal.direction,
                 "price": signal.price,
                 "reason": signal.reason,
@@ -157,6 +225,7 @@ def main_loop():
 
             logger.info("Signal sent and logged.")
             time.sleep(60)
+
         except Exception as e:
             logger.exception("Error in main loop: %s", e)
             time.sleep(60)
