@@ -76,6 +76,7 @@ def main_loop():
     last_signal_time = None
 
     while True:
+        # Still using utcnow (warning is harmless for our use here)
         now_utc = dt.datetime.utcnow()
 
         if not is_within_sessions(
@@ -114,16 +115,18 @@ def main_loop():
 
             # Throttle: avoid spamming repeated signals too quickly
             if last_signal_time and (now_utc - last_signal_time).total_seconds() < 300:
-                logger.info("Signal occurred too soon after previous, skipping (cooldown).")
+                logger.info(
+                    "Signal occurred too soon after previous, skipping (cooldown)."
+                )
                 time.sleep(60)
                 continue
 
-            # Which session are we in?
+            # Session label (single big window)
             hhmm = now_utc.hour * 100 + now_utc.minute
             if settings.session_1_start <= hhmm <= settings.session_1_end:
-                session_window = "08:00-10:00"
+                session_window = "07:00-20:00"
             else:
-                session_window = "12:00-16:00"
+                session_window = "OUTSIDE"
 
             high_news = has_high_impact_news_near(symbol, now_utc)
 
