@@ -50,9 +50,9 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
     tr3 = (low - close.shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    atr = tr.rolling(window=period).mean()
-    plus_di = 100 * (plus_dm.rolling(window=period).sum() / atr)
-    minus_di = 100 * (minus_dm.abs().rolling(window=period).sum() / atr)
+    atr_val = tr.rolling(window=period).mean()
+    plus_di = 100 * (plus_dm.rolling(window=period).sum() / atr_val)
+    minus_di = 100 * (minus_dm.abs().rolling(window=period).sum() / atr_val)
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di)) * 100
     adx_series = dx.rolling(window=period).mean()
     return adx_series, plus_di, minus_di
@@ -74,3 +74,14 @@ def bearish_engulfing(open_: pd.Series, close: pd.Series):
     cond_curr_bear = close < open_
     cond_engulf = (close <= prev_open) & (open_ >= prev_close)
     return cond_prev_bull & cond_curr_bear & cond_engulf
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Average True Range (ATR).
+    """
+    high_low = high - low
+    high_close_prev = (high - close.shift()).abs()
+    low_close_prev = (low - close.shift()).abs()
+    tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
