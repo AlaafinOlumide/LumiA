@@ -1,31 +1,37 @@
-import requests
 import logging
+import requests
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("telegram_client")
+
 
 class TelegramClient:
     def __init__(self, bot_token: str, chat_id: str):
         self.bot_token = bot_token
         self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
 
     def send_message(self, text: str) -> None:
-        if not self.bot_token or not self.chat_id:
-            logger.warning("Telegram token or chat_id not set, skipping send.")
-            return
+        """
+        Send a plain-text message to Telegram.
 
-        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        NOTE: We do NOT use parse_mode here to avoid Markdown/HTML
+        parsing errors like:
+        "Bad Request: can't parse entities: Can't find end of the entity ..."
+        """
+        url = f"{self.base_url}/sendMessage"
         payload = {
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "Markdown",
+            # No parse_mode to keep everything literal
         }
+
         try:
-            r = requests.post(url, json=payload, timeout=10)
-            if not r.ok:
+            resp = requests.post(url, json=payload, timeout=10)
+            if not resp.ok:
                 logger.error(
                     "Failed to send Telegram message: %s - %s",
-                    r.status_code,
-                    r.text,
+                    resp.status_code,
+                    resp.text,
                 )
         except Exception as e:
             logger.exception("Error sending Telegram message: %s", e)
