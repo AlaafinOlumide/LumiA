@@ -7,9 +7,10 @@ import pandas as pd
 
 from config import load_settings, Settings
 from telegram_client import TelegramClient
-from data_fetcher import fetch_m5_ohlcv_hybrid  # now Twelve Data ONLY internally
+from data_fetcher import fetch_m5_ohlcv_hybrid  # Twelve Data ONLY internally
 from strategy import (
     detect_trend_h1,
+    detect_trend_m15_direction,
     confirm_trend_m15,
     trigger_signal_m5,
     is_within_sessions,
@@ -145,7 +146,7 @@ def _trading_confidence_score(
 def build_signal_message(
     symbol_label: str,
     signal,
-    trend_h1: str,
+    trend_label: str,
     session_window: str,
     high_news: bool,
     market_state: str,
@@ -160,7 +161,7 @@ def build_signal_message(
 
     - Header, direction, SL, TP1, TP2
     - RR to TP1/TP2
-    - Time, trend, session, reason
+    - Time, trend bias, session, reason
     - Market state, regime, trend strength, confidence
     - ATR info
     - News + key indicators
@@ -212,7 +213,7 @@ def build_signal_message(
 
     # ----- Context -----
     lines.append(f"Time (UTC): {signal.time.isoformat()}")
-    lines.append(f"Trend (H1): {trend_h1}")
+    lines.append(f"Trend Bias: {trend_label}")
     lines.append(f"Session: {session_window}")
     lines.append(f"Reason: {signal.reason}")
     lines.append("")  # blank
@@ -287,7 +288,7 @@ def main_loop():
     tg = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id)
 
     symbol_label = "XAUUSD"
-    logger.info("Starting XAUUSD bot (Twelve Data only).")
+    logger.info("Starting XAUUSD bot (Twelve Data only, H1 primary, M15 fallback).")
 
     last_signal_time: Optional[dt.datetime] = None
 
@@ -349,21 +350,35 @@ def main_loop():
                 time.sleep(60)
                 continue
 
-            # ---------- H1 TREND ----------
+            # ---------- TREND SELECTION: H1 PRIMARY, M15 FALLBACK ----------
             trend_h1 = detect_trend_h1(h1_df)
-            if trend_h1 is None:
-                logger.info("No clear H1 trend, skipping.")
-                time.sleep(60)
-                continue
+            trend_source = "H1"
+            trend_for_signal: Optional[str] = trend_h1
 
-            # ---------- M15 CONFIRMATION ----------
-            if not confirm_trend_m15(m15_df, trend_h1):
-                logger.info("M15 does not confirm H1 trend, skipping.")
+            if trend_for_signal is not None:
+                # When H1 has a direction, we still require M15 confirmation
+                if not confirm_trend_m15(m15_df, trend_h1):
+                    logger.info("M15 does not confirm H1 trend, skipping.")
+                    time.sleep(60)
+                    continue
+            else:
+                # H1 is ranging / unclear -> try M15 as fallback
+                trend_m15_bias = detect_trend_m15_direction(m15_df)
+                if trend_m15_bias is None:
+                    logger.info("No clear H1 or M15 trend, skipping.")
+                    time.sleep(60)
+                    continue
+                trend_source = "M15"
+                trend_for_signal = trend_m15_bias
+
+            # Safety check
+            if trend_for_signal is None:
+                logger.info("No usable trend_for_signal, skipping.")
                 time.sleep(60)
                 continue
 
             # ---------- M5 TRIGGER ----------
-            signal = trigger_signal_m5(m5_df, trend_h1)
+            signal = trigger_signal_m5(m5_df, trend_for_signal)
             if not signal:
                 logger.info("No M5 trigger signal, sleeping 60s.")
                 time.sleep(60)
@@ -437,6 +452,12 @@ def main_loop():
                 high_news=high_news,
             )
 
+            # Trend label for message
+            if trend_source == "H1":
+                trend_label = f"{trend_for_signal} (H1)"
+            else:
+                trend_label = f"{trend_for_signal} (M15, H1 ranging)"
+
             # Attach everything to signal.extra
             signal.extra["atr_h1"] = atr_h1
             signal.extra["sl"] = sl
@@ -452,7 +473,7 @@ def main_loop():
             msg = build_signal_message(
                 symbol_label,
                 signal,
-                trend_h1,
+                trend_label,
                 session_window,
                 high_news,
                 market_state,
@@ -471,7 +492,7 @@ def main_loop():
                 "direction": signal.direction,
                 "price": signal.price,
                 "reason": signal.reason,
-                "trend_h1": trend_h1,
+                "trend_h1": trend_h1,  # may be None if using M15 fallback
                 "session_window": session_window,
                 "m5_rsi": signal.extra["m5_rsi"],
                 "m5_stoch_k": signal.extra["m5_stoch_k"],
@@ -496,7 +517,11 @@ def main_loop():
             }
             log_signal(row)
 
-            logger.info("Signal sent and logged.")
+            logger.info(
+                "Signal sent and logged. Trend source: %s, direction: %s",
+                trend_source,
+                trend_for_signal,
+            )
             time.sleep(60)
 
         except Exception as e:
