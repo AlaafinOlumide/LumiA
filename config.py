@@ -9,10 +9,11 @@ class Settings:
     xau_symbol: str = "XAU/USD"
 
     # Trading windows in UTC (HHMM)
-    session_1_start: int = 800
-    session_1_end: int = 1000
-    session_2_start: int = 1200
-    session_2_end: int = 1600
+    # Single big window: 07:00–20:00 UTC
+    session_1_start: int = 700
+    session_1_end: int = 2000
+    session_2_start: int = 0   # unused
+    session_2_end: int = 0     # unused
 
 def load_settings() -> Settings:
     return Settings(
