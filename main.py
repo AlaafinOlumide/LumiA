@@ -113,6 +113,7 @@ def main_loop():
     last_m5_fetch_ts: Optional[float] = None
 
     while True:
+        # utcnow is fine here; warning is cosmetic
         now_utc = dt.datetime.utcnow()
 
         if not is_within_sessions(
@@ -135,13 +136,17 @@ def main_loop():
             )
 
             if should_fetch_m5:
-                logger.info("Fetching fresh M5 OHLCV data (hybrid: yfinance -> Twelve Data)...")
+                logger.info(
+                    "Fetching fresh M5 OHLCV data (hybrid: yfinance -> Twelve Data)..."
+                )
                 m5_df = fetch_m5_ohlcv_hybrid(settings)
                 cached_m5_df = m5_df
                 last_m5_fetch_ts = now_ts
             else:
                 if cached_m5_df is None:
-                    logger.info("No cached M5 data yet, fetching hybrid source...")
+                    logger.info(
+                        "No cached M5 data yet, fetching hybrid source..."
+                    )
                     m5_df = fetch_m5_ohlcv_hybrid(settings)
                     cached_m5_df = m5_df
                     last_m5_fetch_ts = now_ts
@@ -155,10 +160,12 @@ def main_loop():
                 continue
 
             # ---------- RESAMPLING ----------
-            h1_df = resample_ohlcv(m5_df, "1H")
-            m15_df = resample_ohlcv(m5_df, "15T")
+            # Use new recommended codes: "1h" and "15min"
+            h1_df = resample_ohlcv(m5_df, "1h")
+            m15_df = resample_ohlcv(m5_df, "15min")
 
-            if len(h1_df) < 30 or len(m15_df) < 30 or len(m5_df) < 30:
+            # Relaxed data requirements (was 30/30/30)
+            if len(h1_df) < 20 or len(m15_df) < 20 or len(m5_df) < 50:
                 logger.info("Not enough data after resampling, sleeping 60s.")
                 time.sleep(60)
                 continue
@@ -198,7 +205,13 @@ def main_loop():
 
             high_news = has_high_impact_news_near(symbol_label, now_utc)
 
-            msg = build_signal_message(symbol_label, signal, trend_h1, session_window, high_news)
+            msg = build_signal_message(
+                symbol_label,
+                signal,
+                trend_h1,
+                session_window,
+                high_news,
+            )
             tg.send_message(msg)
             last_signal_time = now_utc
 
