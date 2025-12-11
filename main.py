@@ -7,7 +7,7 @@ import pandas as pd
 
 from config import load_settings, Settings
 from telegram_client import TelegramClient
-from data_fetcher import fetch_m5_ohlcv_hybrid  # Twelve Data ONLY internally
+from data_fetcher import fetch_m5_ohlcv_hybrid  # implemented to call Twelve Data
 from strategy import (
     detect_trend_h1,
     detect_trend_m15_direction,
@@ -182,12 +182,15 @@ def build_signal_message(
         news_line = "ℹ️ No high-impact news flag near this time."
 
     entry = signal.price
+    setup_type = signal.extra.get("setup_type", "GENERIC")
 
     lines: list[str] = []
 
     # ----- Header + entry + TP/SL + RR -----
     lines.append(f"XAUUSD Signal [{risk_tag}]")
     lines.append(f"{arrow} {symbol_label} at {entry:.2f}")
+    if setup_type != "GENERIC":
+        lines.append(f"Setup: {setup_type}")
 
     if sl is not None and tp1 is not None and tp2 is not None:
         lines.append(f"– SL: {sl:.2f}")
@@ -318,17 +321,13 @@ def main_loop():
             )
 
             if should_fetch_m5:
-                logger.info(
-                    "Fetching fresh M5 OHLCV data from Twelve Data..."
-                )
+                logger.info("Fetching fresh M5 OHLCV data from Twelve Data...")
                 m5_df = fetch_m5_ohlcv_hybrid(settings)
                 cached_m5_df = m5_df
                 last_m5_fetch_ts = now_ts
             else:
                 if cached_m5_df is None:
-                    logger.info(
-                        "No cached M5 data yet, fetching from Twelve Data..."
-                    )
+                    logger.info("No cached M5 data yet, fetching from Twelve Data...")
                     m5_df = fetch_m5_ohlcv_hybrid(settings)
                     cached_m5_df = m5_df
                     last_m5_fetch_ts = now_ts
