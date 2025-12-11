@@ -1,8 +1,8 @@
 import logging
+from typing import Optional
 
 import pandas as pd
 import requests
-import yfinance as yf
 
 from config import Settings
 
@@ -11,13 +11,11 @@ logger = logging.getLogger(__name__)
 TD_BASE_URL = "https://api.twelvedata.com/time_series"
 
 
-# ---------- Twelve Data fetch ----------
-
 def fetch_ohlcv_twelvedata(
     api_key: str,
     symbol: str,
     interval: str,
-    outputsize: int = 150,
+    outputsize: int = 300,
 ) -> pd.DataFrame:
     """
     Fetch OHLCV data from Twelve Data and return as DataFrame sorted by time ascending.
@@ -48,107 +46,26 @@ def fetch_ohlcv_twelvedata(
         df["volume"] = df["volume"].astype(float)
     else:
         df["volume"] = 0.0
-    df = df.sort_values("datetime").reset_index(drop=True)
-    return df
-
-
-# ---------- Yahoo Finance fetch ----------
-
-def fetch_ohlcv_yfinance(
-    symbol: str,
-    interval: str = "5m",
-    period: str = "7d",
-) -> pd.DataFrame:
-    """
-    Fetch OHLCV from Yahoo Finance using yfinance.
-
-    symbol example: "XAU=X"
-    interval example: "5m"
-    period example: "7d"
-    """
-    # Auto-fix old symbol if env/config still uses XAUUSD=X
-    symbol = symbol.strip().upper()
-    if symbol == "XAUUSD=X":
-        logger.warning("Symbol XAUUSD=X is invalid on Yahoo. Auto-switching to XAU=X.")
-        symbol = "XAU=X"
-
-    logger.info(
-        "Calling Yahoo Finance (yfinance) for %s interval %s period %s",
-        symbol,
-        interval,
-        period,
-    )
-    df = yf.download(
-        symbol,
-        interval=interval,
-        period=period,
-        progress=False,
-        auto_adjust=False,  # keep raw OHLC
-    )
-
-    if df is None or df.empty:
-        raise RuntimeError("Empty DataFrame from yfinance")
-
-    # yfinance returns columns: Open, High, Low, Close, Adj Close, Volume
-    df = df.reset_index()
-    rename_map = {
-        "Datetime": "datetime",
-        "Date": "datetime",
-        "Open": "open",
-        "High": "high",
-        "Low": "low",
-        "Close": "close",
-        "Volume": "volume",
-    }
-    df = df.rename(columns=rename_map)
-
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df["open"] = df["open"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["close"] = df["close"].astype(float)
-    df["volume"] = df["volume"].astype(float)
 
     df = df.sort_values("datetime").reset_index(drop=True)
     return df
 
-
-# ---------- Hybrid fetch for M5 ----------
 
 def fetch_m5_ohlcv_hybrid(settings: Settings) -> pd.DataFrame:
     """
-    Hybrid data fetch:
-    1) Try Yahoo Finance 5m data (XAU=X by default).
-    2) If that fails, fall back to Twelve Data 5min (XAU/USD by default).
-    """
-    # Try yfinance first
-    try:
-        df_yf = fetch_ohlcv_yfinance(
-            symbol=settings.xau_symbol_yf,
-            interval="5m",
-            period="7d",
-        )
-        if df_yf is not None and not df_yf.empty:
-            logger.info("Using yfinance data for symbol %s", settings.xau_symbol_yf)
-            return df_yf
-        logger.warning("yfinance returned empty data, falling back to Twelve Data.")
-    except Exception as e:
-        logger.warning(
-            "yfinance fetch failed (%s), falling back to Twelve Data.",
-            e,
-        )
+    Previously: yfinance primary, Twelve Data fallback.
+    Now: Twelve Data ONLY (XAU/USD, 5min).
 
-    # Fallback: Twelve Data
+    Kept the function name the same so main.py does not need to change imports.
+    """
     if not settings.twelvedata_api_key:
-        raise RuntimeError(
-            "Twelve Data API key missing and yfinance failed; cannot fetch data."
-        )
+        raise RuntimeError("Twelve Data API key missing; cannot fetch data.")
 
     df_td = fetch_ohlcv_twelvedata(
         api_key=settings.twelvedata_api_key,
-        symbol=settings.xau_symbol_td,
+        symbol=settings.xau_symbol_td,  # e.g. "XAU/USD"
         interval="5min",
-        outputsize=300,  # ~25 hours of data
+        outputsize=300,  # ~25 hours of 5m candles
     )
     logger.info("Using Twelve Data data for symbol %s", settings.xau_symbol_td)
     return df_td
