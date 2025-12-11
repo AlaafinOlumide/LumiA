@@ -27,6 +27,12 @@ FIELDNAMES = [
     "sl",
     "tp1",
     "tp2",
+    "adx_h1",
+    "market_state",
+    "market_regime",
+    "trend_strength_label",
+    "confidence_score",
+    "confidence_label",
 ]
 
 
