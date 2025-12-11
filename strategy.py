@@ -47,6 +47,10 @@ def is_within_sessions(
     return in_session_1 or in_session_2
 
 
+# ---------------------------------------------------------------------------
+# H1 TREND DETECTION (PRIMARY)
+# ---------------------------------------------------------------------------
+
 def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
     """
     Detect H1 trend direction.
@@ -102,6 +106,53 @@ def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# NEW: M15 TREND DETECTION (FALLBACK WHEN H1 IS RANGING)
+# ---------------------------------------------------------------------------
+
+def detect_trend_m15_direction(m15_df: pd.DataFrame) -> Optional[str]:
+    """
+    Detect M15 trend direction, used as a fallback when H1 has no clear trend.
+
+    Uses EMA(20) vs EMA(50) + ADX(14).
+    Returns:
+        "LONG", "SHORT", or None.
+    """
+    if m15_df is None or m15_df.empty or len(m15_df) < 50:
+        return None
+
+    close = m15_df["close"]
+    ema_fast = ema(close, 20)
+    ema_slow = ema(close, 50)
+
+    ema_fast_last = float(ema_fast.iloc[-1])
+    ema_slow_last = float(ema_slow.iloc[-1])
+    close_last = float(close.iloc[-1])
+
+    adx_series, _, _ = adx(
+        m15_df["high"], m15_df["low"], m15_df["close"], period=14
+    )
+    adx_last = float(adx_series.iloc[-1])
+
+    ema_diff = ema_fast_last - ema_slow_last
+    ema_diff_ratio = abs(ema_diff) / close_last if close_last > 0 else 0.0
+
+    # If EMAs are very flat/tight AND ADX is very weak -> no real trend here either.
+    if ema_diff_ratio < 0.0008 and adx_last < 10:
+        return None
+
+    if ema_fast_last > ema_slow_last:
+        return "LONG"
+    elif ema_fast_last < ema_slow_last:
+        return "SHORT"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# M15 CONFIRMATION (USED WHEN H1 IS PRIMARY)
+# ---------------------------------------------------------------------------
+
 def confirm_trend_m15(m15_df: pd.DataFrame, trend_h1: str) -> bool:
     """
     Confirm H1 trend using M15 structure.
@@ -140,9 +191,13 @@ def confirm_trend_m15(m15_df: pd.DataFrame, trend_h1: str) -> bool:
     return False
 
 
-def trigger_signal_m5(m5_df: pd.DataFrame, trend_h1: str) -> Optional[Signal]:
+# ---------------------------------------------------------------------------
+# M5 TRIGGER (USES trend_for_signal WHICH MAY COME FROM H1 OR M15)
+# ---------------------------------------------------------------------------
+
+def trigger_signal_m5(m5_df: pd.DataFrame, trend_for_signal: str) -> Optional[Signal]:
     """
-    Generate a LONG/SHORT signal on M5 in the direction of the H1 trend.
+    Generate a LONG/SHORT signal on M5 in the direction of the higher-timeframe bias.
 
     Uses:
     - Bollinger Bands (20, 2)
@@ -170,7 +225,9 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_h1: str) -> Optional[Signal]:
     stoch_k, stoch_d = stochastic_oscillator(
         high_series, low_series, close_series, k_period=14, d_period=3
     )
-    bb_upper, bb_mid, bb_lower = bollinger_bands(close_series, period=20, std_factor=2.0)
+    bb_upper, bb_mid, bb_lower = bollinger_bands(
+        close_series, period=20, std_factor=2.0
+    )
     adx_series, plus_di, minus_di = adx(
         high_series, low_series, close_series, period=14
     )
@@ -211,7 +268,7 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_h1: str) -> Optional[Signal]:
         return None
 
     # LONG setup: pullback in uptrend + bullish confirmation
-    if trend_h1 == "LONG":
+    if trend_for_signal == "LONG":
         # Price near mid/lower band = pullback
         near_band = (close_val <= bb_mid_val) or (close_val <= bb_lower_val * 1.01)
         momentum_ok = (rsi_val < 60) and (stoch_k_val < 70)
@@ -231,7 +288,7 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_h1: str) -> Optional[Signal]:
             )
 
     # SHORT setup: pullback in downtrend + bearish confirmation
-    if trend_h1 == "SHORT":
+    if trend_for_signal == "SHORT":
         near_band = (close_val >= bb_mid_val) or (close_val >= bb_upper_val * 0.99)
         momentum_ok = (rsi_val > 40) and (stoch_k_val > 30)
         adx_bias_down = minus_di_val > plus_di_val
