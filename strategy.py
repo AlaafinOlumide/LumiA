@@ -192,18 +192,21 @@ def confirm_trend_m15(m15_df: pd.DataFrame, trend_h1: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# M5 TRIGGER (LOOSER: MORE SIGNALS, STILL IN TREND DIRECTION)
+# M5 TRIGGER: PULLBACKS + BREAKOUTS
 # ---------------------------------------------------------------------------
 
 def trigger_signal_m5(m5_df: pd.DataFrame, trend_for_signal: str) -> Optional[Signal]:
     """
     Generate a LONG/SHORT signal on M5 in the direction of the higher-timeframe bias.
 
-    Loosened conditions for more signals:
-    - ADX floor lowered from 8 -> 5
-    - Wider "near band" definition
-    - Momentum less strict
-    - Candle filter: engulfing OR strong candle in trend direction.
+    Now supports TWO types of entries:
+    - PULLBACK: price retraces to BB mid/lower (uptrend) / mid/upper (downtrend)
+    - BREAKOUT: strong momentum candle through BB upper/lower in trend direction
+
+    Loosened conditions overall for more signals:
+    - ADX floor = 5
+    - Slightly wider Bollinger proximity
+    - Candle can be engulfing OR generally strong in the trend direction
     """
     if m5_df is None or m5_df.empty or len(m5_df) < 50:
         return None
@@ -264,25 +267,28 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_for_signal: str) -> Optional[Si
         return None
 
     # Helper: strong candles in direction of trend
-    is_strong_bull = close_val > open_val and close_val > bb_mid_val
-    is_strong_bear = close_val < open_val and close_val < bb_mid_val
+    is_strong_bull = (close_val > open_val) and (close_val >= bb_mid_val)
+    is_strong_bear = (close_val < open_val) and (close_val <= bb_mid_val)
 
-    # LONG setup: pullback in uptrend + bullish confirmation
+    # -----------------------------------------------------------------------
+    # LONG SIDE: PULLBACK + BREAKOUT
+    # -----------------------------------------------------------------------
     if trend_for_signal == "LONG":
-        # Price near mid/lower band = pullback (wider tolerance)
-        near_band = (close_val <= bb_mid_val * 1.01) or (close_val <= bb_lower_val * 1.02)
-        # Momentum: allow slightly higher RSI / Stoch for more opportunities
-        momentum_ok = (rsi_val < 65) and (stoch_k_val < 80)
-        # Directional ADX bias
-        adx_bias_up = plus_di_val >= minus_di_val
-        # Candle confirmation: engulfing OR strong bullish bar
-        candle_ok = is_bull_engulf or is_strong_bull
+        # --- Pullback conditions ---
+        pullback_near_band = (
+            (close_val <= bb_mid_val * 1.01)  # slightly under / around mid
+            or (close_val <= bb_lower_val * 1.03)  # or near lower band
+        )
+        pullback_momentum_ok = (rsi_val < 65) and (stoch_k_val < 80)
+        pullback_adx_bias = plus_di_val >= minus_di_val
+        pullback_candle_ok = is_bull_engulf or is_strong_bull
 
-        if near_band and momentum_ok and adx_bias_up and candle_ok:
+        if pullback_near_band and pullback_momentum_ok and pullback_adx_bias and pullback_candle_ok:
             reason = (
-                "Looser LONG: M5 pullback in uptrend (BB mid/lower, wider tolerance), "
+                "PULLBACK LONG: M5 pullback in uptrend (BB mid/lower, wider tolerance), "
                 "RSI < 65, StochK < 80, bullish engulfing or strong bullish candle."
             )
+            extra["setup_type"] = "PULLBACK_LONG"
             return Signal(
                 direction="LONG",
                 price=close_val,
@@ -291,19 +297,45 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_for_signal: str) -> Optional[Si
                 extra=extra,
             )
 
-    # SHORT setup: pullback in downtrend + bearish confirmation
-    if trend_for_signal == "SHORT":
-        # Price near mid/upper band = pullback (wider tolerance)
-        near_band = (close_val >= bb_mid_val * 0.99) or (close_val >= bb_upper_val * 0.98)
-        momentum_ok = (rsi_val > 35) and (stoch_k_val > 20)
-        adx_bias_down = minus_di_val >= plus_di_val
-        candle_ok = is_bear_engulf or is_strong_bear
+        # --- Breakout conditions ---
+        breakout_bb = close_val >= bb_upper_val * 0.999  # near/through upper band
+        breakout_momentum = (rsi_val >= 60) and (stoch_k_val >= 60)
+        breakout_adx_bias = plus_di_val > minus_di_val
+        breakout_candle_ok = (close_val > open_val) and (close_val >= bb_upper_val)
 
-        if near_band and momentum_ok and adx_bias_down and candle_ok:
+        if breakout_bb and breakout_momentum and breakout_adx_bias and breakout_candle_ok:
             reason = (
-                "Looser SHORT: M5 pullback in downtrend (BB mid/upper, wider tolerance), "
+                "BREAKOUT LONG: M5 momentum candle through upper Bollinger band "
+                "in line with uptrend (RSI >= 60, StochK >= 60, +DI > -DI)."
+            )
+            extra["setup_type"] = "BREAKOUT_LONG"
+            return Signal(
+                direction="LONG",
+                price=close_val,
+                time=time_val,
+                reason=reason,
+                extra=extra,
+            )
+
+    # -----------------------------------------------------------------------
+    # SHORT SIDE: PULLBACK + BREAKOUT
+    # -----------------------------------------------------------------------
+    if trend_for_signal == "SHORT":
+        # --- Pullback conditions ---
+        pullback_near_band = (
+            (close_val >= bb_mid_val * 0.99)  # slightly above / around mid
+            or (close_val >= bb_upper_val * 0.97)  # near upper band
+        )
+        pullback_momentum_ok = (rsi_val > 35) and (stoch_k_val > 20)
+        pullback_adx_bias = minus_di_val >= plus_di_val
+        pullback_candle_ok = is_bear_engulf or is_strong_bear
+
+        if pullback_near_band and pullback_momentum_ok and pullback_adx_bias and pullback_candle_ok:
+            reason = (
+                "PULLBACK SHORT: M5 pullback in downtrend (BB mid/upper, wider tolerance), "
                 "RSI > 35, StochK > 20, bearish engulfing or strong bearish candle."
             )
+            extra["setup_type"] = "PULLBACK_SHORT"
             return Signal(
                 direction="SHORT",
                 price=close_val,
@@ -312,4 +344,25 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_for_signal: str) -> Optional[Si
                 extra=extra,
             )
 
+        # --- Breakout conditions ---
+        breakout_bb = close_val <= bb_lower_val * 1.001  # near/through lower band
+        breakout_momentum = (rsi_val <= 40) and (stoch_k_val <= 40)
+        breakout_adx_bias = minus_di_val > plus_di_val
+        breakout_candle_ok = (close_val < open_val) and (close_val <= bb_lower_val)
+
+        if breakout_bb and breakout_momentum and breakout_adx_bias and breakout_candle_ok:
+            reason = (
+                "BREAKOUT SHORT: M5 momentum candle through lower Bollinger band "
+                "in line with downtrend (RSI <= 40, StochK <= 40, -DI > +DI)."
+            )
+            extra["setup_type"] = "BREAKOUT_SHORT"
+            return Signal(
+                direction="SHORT",
+                price=close_val,
+                time=time_val,
+                reason=reason,
+                extra=extra,
+            )
+
+    # Nothing matched
     return None
