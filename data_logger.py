@@ -23,6 +23,10 @@ FIELDNAMES = [
     "plus_di_m5",
     "minus_di_m5",
     "high_impact_news",
+    "atr_h1",
+    "sl",
+    "tp1",
+    "tp2",
 ]
 
 
