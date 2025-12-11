@@ -16,7 +16,7 @@ from strategy import (
 )
 from data_logger import log_signal
 from high_impact_news import has_high_impact_news_near
-from indicators import atr  # NEW: ATR import
+from indicators import atr, adx  # ATR + ADX
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,30 +40,34 @@ def _risk_tag_from_adx(adx_m5: float) -> str:
 def build_signal_message(
     symbol_label: str,
     signal,
-    trend_h1,
+    trend_h1: str,
     session_window: str,
     high_news: bool,
+    market_state: str,
+    adx_h1_value: float,
 ) -> str:
     """
     Build Telegram message in the requested order:
 
     XAUUSD Signal [SCALP]
     🟢 BUY XAUUSD at 2420.50
-    – SL: 2409.10
-    – TP1: 2435.70
-    – TP2: 2443.30
+    – SL: ...
+    – TP1: ...
+    – TP2: ...
 
     Time (UTC): ...
     Trend (H1): ...
     Session: ...
     Reason: ...
 
+    Market State (H1): RANGING / weak trend (ADX 17.8)
     Suggested TP/SL (ATR-based)
     – ATR(H1, 14): ...
 
     ⚠️ HIGH-IMPACT NEWS NEARBY — expect extra volatility.
     RSI(M5): ...
-    ...
+    ADX(M5): ...
+    BB(M5): ...
     """
     adx_m5 = signal.extra["adx_m5"]
     risk_tag = _risk_tag_from_adx(adx_m5)
@@ -80,7 +84,7 @@ def build_signal_message(
     else:
         news_line = "ℹ️ No high-impact news flag near this time."
 
-    lines = []
+    lines: list[str] = []
 
     # Header + entry + TP/SL
     lines.append(f"XAUUSD Signal [{risk_tag}]")
@@ -89,20 +93,26 @@ def build_signal_message(
         lines.append(f"– SL: {sl:.2f}")
         lines.append(f"– TP1: {tp1:.2f}")
         lines.append(f"– TP2: {tp2:.2f}")
-    lines.append("")  # blank line
+    lines.append("")  # blank
 
     # Context
     lines.append(f"Time (UTC): {signal.time.isoformat()}")
     lines.append(f"Trend (H1): {trend_h1}")
     lines.append(f"Session: {session_window}")
     lines.append(f"Reason: {signal.reason}")
-    lines.append("")  # blank line
+    lines.append("")  # blank
+
+    # Market state (range vs trend)
+    lines.append(
+        f"Market State (H1): {market_state} (ADX {adx_h1_value:.2f})"
+    )
+    lines.append("")  # blank
 
     # ATR info
     lines.append("Suggested TP/SL (ATR-based)")
     if atr_h1 is not None:
         lines.append(f"– ATR(H1, 14): {atr_h1:.2f}")
-    lines.append("")  # blank line
+    lines.append("")  # blank
 
     # News & indicators
     lines.append(news_line)
@@ -129,7 +139,6 @@ def build_signal_message(
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     """
     Resample a 5m OHLCV DataFrame to a higher timeframe (15m, 1h, etc.).
-    Assumes df has columns: datetime, open, high, low, close, volume.
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -219,25 +228,27 @@ def main_loop():
                 time.sleep(60)
                 continue
 
-            # ---------- STRATEGY ----------
+            # ---------- H1 TREND ----------
             trend_h1 = detect_trend_h1(h1_df)
             if trend_h1 is None:
                 logger.info("No clear H1 trend, skipping.")
                 time.sleep(60)
                 continue
 
+            # ---------- M15 CONFIRMATION ----------
             if not confirm_trend_m15(m15_df, trend_h1):
                 logger.info("M15 does not confirm H1 trend, skipping.")
                 time.sleep(60)
                 continue
 
+            # ---------- M5 TRIGGER ----------
             signal = trigger_signal_m5(m5_df, trend_h1)
             if not signal:
                 logger.info("No M5 trigger signal, sleeping 60s.")
                 time.sleep(60)
                 continue
 
-            # Cooldown to avoid spam
+            # Cooldown
             if last_signal_time and (now_utc - last_signal_time).total_seconds() < 300:
                 logger.info(
                     "Signal occurred too soon after previous, skipping (cooldown)."
@@ -245,9 +256,24 @@ def main_loop():
                 time.sleep(60)
                 continue
 
-            # ---------- DYNAMIC TP/SL (ATR-BASED, SCALP/SWING) ----------
+            # ---------- DYNAMIC TP/SL (ATR + SCALP/SWING) ----------
             atr_series = atr(h1_df["high"], h1_df["low"], h1_df["close"], period=14)
             atr_h1 = float(atr_series.iloc[-1])
+
+            adx_h1_series, _, _ = adx(
+                h1_df["high"], h1_df["low"], h1_df["close"], period=14
+            )
+            adx_h1_value = float(adx_h1_series.iloc[-1])
+
+            # Market state: B = do not block signals, just warn if weak
+            if adx_h1_value < 18:
+                market_state = "RANGING / weak trend"
+            else:
+                market_state = "TRENDING"
+
+            signal.extra["atr_h1"] = atr_h1
+            signal.extra["adx_h1"] = adx_h1_value
+            signal.extra["market_state"] = market_state
 
             adx_m5 = signal.extra["adx_m5"]
             risk_tag = _risk_tag_from_adx(adx_m5)
@@ -271,12 +297,11 @@ def main_loop():
                 tp1 = entry_price - tp1_mult * atr_h1
                 tp2 = entry_price - tp2_mult * atr_h1
 
-            signal.extra["atr_h1"] = atr_h1
             signal.extra["sl"] = sl
             signal.extra["tp1"] = tp1
             signal.extra["tp2"] = tp2
 
-            # Session label
+            # ---------- SESSION LABEL ----------
             hhmm = now_utc.hour * 100 + now_utc.minute
             if settings.session_1_start <= hhmm <= settings.session_1_end:
                 session_window = "07:00-20:00"
@@ -291,6 +316,8 @@ def main_loop():
                 trend_h1,
                 session_window,
                 high_news,
+                market_state,
+                adx_h1_value,
             )
             tg.send_message(msg)
             last_signal_time = now_utc
@@ -313,10 +340,12 @@ def main_loop():
                 "plus_di_m5": signal.extra["plus_di_m5"],
                 "minus_di_m5": signal.extra["minus_di_m5"],
                 "high_impact_news": high_news,
-                "atr_h1": signal.extra.get("atr_h1", ""),
-                "sl": signal.extra.get("sl", ""),
-                "tp1": signal.extra.get("tp1", ""),
-                "tp2": signal.extra.get("tp2", ""),
+                "atr_h1": atr_h1,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "adx_h1": adx_h1_value,
+                "market_state": market_state,
             }
             log_signal(row)
 
