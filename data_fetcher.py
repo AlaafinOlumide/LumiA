@@ -66,6 +66,12 @@ def fetch_ohlcv_yfinance(
     interval example: "5m"
     period example: "7d"
     """
+    # Auto-fix old symbol if env/config still uses XAUUSD=X
+    symbol = symbol.strip().upper()
+    if symbol == "XAUUSD=X":
+        logger.warning("Symbol XAUUSD=X is invalid on Yahoo. Auto-switching to XAU=X.")
+        symbol = "XAU=X"
+
     logger.info(
         "Calling Yahoo Finance (yfinance) for %s interval %s period %s",
         symbol,
@@ -84,11 +90,10 @@ def fetch_ohlcv_yfinance(
         raise RuntimeError("Empty DataFrame from yfinance")
 
     # yfinance returns columns: Open, High, Low, Close, Adj Close, Volume
-    df = df.reset_index()  # Make datetime a column named e.g. "Datetime"
-    # Normalize column names to match the rest of the bot
+    df = df.reset_index()
     rename_map = {
         "Datetime": "datetime",
-        "Date": "datetime",  # just in case
+        "Date": "datetime",
         "Open": "open",
         "High": "high",
         "Low": "low",
@@ -97,7 +102,6 @@ def fetch_ohlcv_yfinance(
     }
     df = df.rename(columns=rename_map)
 
-    # Ensure dtype consistency
     df["datetime"] = pd.to_datetime(df["datetime"])
     df["open"] = df["open"].astype(float)
     df["high"] = df["high"].astype(float)
@@ -116,9 +120,6 @@ def fetch_m5_ohlcv_hybrid(settings: Settings) -> pd.DataFrame:
     Hybrid data fetch:
     1) Try Yahoo Finance 5m data (XAU=X by default).
     2) If that fails, fall back to Twelve Data 5min (XAU/USD by default).
-
-    Returns a 5m OHLCV DataFrame with columns:
-    datetime, open, high, low, close, volume
     """
     # Try yfinance first
     try:
@@ -128,10 +129,7 @@ def fetch_m5_ohlcv_hybrid(settings: Settings) -> pd.DataFrame:
             period="7d",
         )
         if df_yf is not None and not df_yf.empty:
-            logger.info(
-                "Using yfinance data for symbol %s",
-                settings.xau_symbol_yf,
-            )
+            logger.info("Using yfinance data for symbol %s", settings.xau_symbol_yf)
             return df_yf
         logger.warning("yfinance returned empty data, falling back to Twelve Data.")
     except Exception as e:
@@ -152,8 +150,5 @@ def fetch_m5_ohlcv_hybrid(settings: Settings) -> pd.DataFrame:
         interval="5min",
         outputsize=300,  # ~25 hours of data
     )
-    logger.info(
-        "Using Twelve Data data for symbol %s",
-        settings.xau_symbol_td,
-    )
+    logger.info("Using Twelve Data data for symbol %s", settings.xau_symbol_td)
     return df_td
