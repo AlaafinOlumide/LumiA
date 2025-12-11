@@ -7,7 +7,7 @@ import pandas as pd
 
 from config import load_settings, Settings
 from telegram_client import TelegramClient
-from data_fetcher import fetch_m5_ohlcv_hybrid
+from data_fetcher import fetch_m5_ohlcv_hybrid  # now Twelve Data ONLY internally
 from strategy import (
     detect_trend_h1,
     confirm_trend_m15,
@@ -90,7 +90,6 @@ def _market_state_and_regime(
         else:
             regime = "High-Vol Trend"
 
-    # Include volatility label in the regime description
     regime_full = f"{regime} ({vol_label})"
     return state, regime_full
 
@@ -183,7 +182,7 @@ def build_signal_message(
 
     entry = signal.price
 
-    lines = []
+    lines: list[str] = []
 
     # ----- Header + entry + TP/SL + RR -----
     lines.append(f"XAUUSD Signal [{risk_tag}]")
@@ -288,9 +287,7 @@ def main_loop():
     tg = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id)
 
     symbol_label = "XAUUSD"
-    logger.info(
-        "Starting XAUUSD bot (hybrid data: yfinance primary, Twelve Data fallback)."
-    )
+    logger.info("Starting XAUUSD bot (Twelve Data only).")
 
     last_signal_time: Optional[dt.datetime] = None
 
@@ -321,7 +318,7 @@ def main_loop():
 
             if should_fetch_m5:
                 logger.info(
-                    "Fetching fresh M5 OHLCV data (hybrid: yfinance -> Twelve Data)..."
+                    "Fetching fresh M5 OHLCV data from Twelve Data..."
                 )
                 m5_df = fetch_m5_ohlcv_hybrid(settings)
                 cached_m5_df = m5_df
@@ -329,7 +326,7 @@ def main_loop():
             else:
                 if cached_m5_df is None:
                     logger.info(
-                        "No cached M5 data yet, fetching hybrid source..."
+                        "No cached M5 data yet, fetching from Twelve Data..."
                     )
                     m5_df = fetch_m5_ohlcv_hybrid(settings)
                     cached_m5_df = m5_df
