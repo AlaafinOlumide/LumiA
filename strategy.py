@@ -39,24 +39,36 @@ def is_within_sessions(
 def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[Direction]:
     """
     Use EMA + ADX + DI to detect main trend on H1.
-    Loosened slightly: ADX threshold 18 instead of 20.
+
+    Loosened:
+    - ADX threshold reduced.
+    - If ADX is low but price is clearly above/below EMA and DI agrees,
+      we still allow a trend.
     """
     df = h1_df.copy()
     df["ema_fast"] = ema(df["close"], 50)
     adx_series, plus_di, minus_di = adx(df["high"], df["low"], df["close"], period=14)
     last = df.iloc[-1]
-    last_adx = adx_series.iloc[-1]
-    last_plus = plus_di.iloc[-1]
-    last_minus = minus_di.iloc[-1]
+    last_adx = float(adx_series.iloc[-1])
+    last_plus = float(plus_di.iloc[-1])
+    last_minus = float(minus_di.iloc[-1])
 
-    # Looser threshold
-    if last_adx < 18:
-        return None  # weak trend
+    price = float(last["close"])
+    ema_fast = float(last["ema_fast"])
 
-    if last["close"] > last["ema_fast"] and last_plus > last_minus:
+    # Primary ADX-based logic: allow weaker trends
+    if last_adx >= 15:
+        if price > ema_fast and last_plus > last_minus:
+            return "LONG"
+        if price < ema_fast and last_minus > last_plus:
+            return "SHORT"
+
+    # Fallback logic: clear EMA + DI direction even if ADX < 15
+    if price > ema_fast and last_plus > last_minus:
         return "LONG"
-    if last["close"] < last["ema_fast"] and last_minus > last_plus:
+    if price < ema_fast and last_minus > last_plus:
         return "SHORT"
+
     return None
 
 
@@ -95,7 +107,7 @@ def trigger_signal_m5(m5_df: pd.DataFrame, direction: Direction) -> Optional[Sig
     if last["adx"] < 15:
         return None
 
-    reason = None
+    reason: Optional[str] = None
 
     if direction == "LONG":
         cond_bb = last["close"] <= last["bb_mid"]  # pullback
