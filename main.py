@@ -19,9 +19,6 @@ from strategy import (
     trigger_signal_m5,
 )
 
-# -------------------------
-# Logging
-# -------------------------
 logger = logging.getLogger("xauusd_bot")
 logging.basicConfig(
     level=logging.INFO,
@@ -29,14 +26,7 @@ logging.basicConfig(
 )
 
 
-# -------------------------
-# Resampling (M5 -> M15/H1)
-# -------------------------
 def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """
-    rule: "15min" or "1h"
-    Expects df with a datetime column (UTC) or datetime index.
-    """
     tmp = df.copy()
     if "datetime" in tmp.columns:
         tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True)
@@ -55,9 +45,6 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return agg.reset_index()
 
 
-# -------------------------
-# Labels / Classifiers
-# -------------------------
 def setup_label(setup_type: str) -> str:
     if not setup_type:
         return "Generic"
@@ -95,14 +82,10 @@ def confidence_label(score: int) -> str:
 
 
 def risk_tag_from_adx_m5(adx_m5: float) -> str:
-    # keep consistent tag style (you can expand later)
     return "SCALP"
 
 
 def market_regime(h1_df: pd.DataFrame) -> str:
-    """
-    Simple regime using Bollinger width + ATR magnitude (H1).
-    """
     if h1_df is None or len(h1_df) < 60:
         return "Unknown"
 
@@ -118,7 +101,6 @@ def market_regime(h1_df: pd.DataFrame) -> str:
     bw_last = float(bw.iloc[-1]) if pd.notna(bw.iloc[-1]) else 0.0
     atr_last = float(a.iloc[-1]) if pd.notna(a.iloc[-1]) else 0.0
 
-    # rough, stable buckets
     if bw_last >= 0.02 or atr_last >= 20:
         return "High Volatility"
     if bw_last <= 0.008 and atr_last <= 10:
@@ -126,13 +108,7 @@ def market_regime(h1_df: pd.DataFrame) -> str:
     return "Normal Volatility"
 
 
-# -------------------------
-# Dynamic TP/SL (ATR-based)
-# -------------------------
 def tp_sl_multipliers(setup_type: str) -> Tuple[float, float, float]:
-    """
-    (sl_mult, tp1_mult, tp2_mult) on ATR(H1,14)
-    """
     if setup_type.startswith("PULLBACK"):
         return (0.90, 1.60, 2.60)
     if setup_type.startswith("BREAKOUT_CONT"):
@@ -175,9 +151,6 @@ def apply_dynamic_tp_sl(signal, h1_df: pd.DataFrame) -> None:
     signal.extra["tp2"] = tp2
 
 
-# -------------------------
-# Confidence Score
-# -------------------------
 def compute_confidence(
     trend_source: str,
     setup_type: str,
@@ -186,11 +159,8 @@ def compute_confidence(
     high_news: bool,
 ) -> int:
     score = 50
-
-    # Trend source reliability
     score += 10 if trend_source == "H1" else 5
 
-    # Setup quality
     if setup_type.startswith("PULLBACK"):
         score += 15
     elif setup_type.startswith("BREAKOUT"):
@@ -198,7 +168,6 @@ def compute_confidence(
     elif setup_type.startswith("BREAKOUT_CONT"):
         score += 3
 
-    # Trend strength (real ADX H1)
     if adx_h1 >= 30:
         score += 12
     elif adx_h1 >= 20:
@@ -206,22 +175,17 @@ def compute_confidence(
     else:
         score -= 6
 
-    # Micro structure (M5 ADX)
     if adx_m5 >= 25:
         score += 6
     elif adx_m5 < 15:
         score -= 5
 
-    # News penalty
     if high_news:
         score -= 12
 
     return max(0, min(100, score))
 
 
-# -------------------------
-# Telegram message (PLAIN TEXT, no markdown)
-# -------------------------
 def build_signal_message(
     symbol_label: str,
     signal,
@@ -261,7 +225,6 @@ def build_signal_message(
         lines.append(f"TP1: {float(tp1):.2f}")
         lines.append(f"TP2: {float(tp2):.2f}")
 
-        # RR
         if signal.direction == "LONG":
             risk = entry - float(sl)
             rr1 = (float(tp1) - entry) / risk if risk > 0 else 0.0
@@ -312,9 +275,6 @@ def build_signal_message(
     return "\n".join(lines)
 
 
-# -------------------------
-# Main loop
-# -------------------------
 def main():
     settings = load_settings()
 
@@ -337,7 +297,6 @@ def main():
     while True:
         now_utc = dt.datetime.now(dt.timezone.utc)
 
-        # Single big window: 07:00–20:00 UTC
         if not is_within_sessions(
             now_utc=now_utc,
             session_1_start=s1_start,
@@ -349,13 +308,13 @@ def main():
             time.sleep(sleep_seconds)
             continue
 
-        # Fetch/cached M5
         need_fetch = (time.time() - last_fetch_ts) >= fetch_interval_seconds or cached_m5 is None
         if need_fetch:
             logger.info("Fetching fresh M5 OHLCV data from Twelve Data...")
             cached_m5 = fetch_m5_ohlcv_twelvedata(
                 symbol=symbol_td,
                 api_key=settings.twelvedata_api_key,
+                outputsize=300,
             )
             last_fetch_ts = time.time()
         else:
@@ -366,7 +325,6 @@ def main():
             time.sleep(sleep_seconds)
             continue
 
-        # Resample
         m15_df = resample_ohlc(cached_m5, "15min")
         h1_df = resample_ohlc(cached_m5, "1h")
 
@@ -375,16 +333,13 @@ def main():
             time.sleep(sleep_seconds)
             continue
 
-        # Real ADX(H1)
         adx_h1_series, _, _ = indicators.adx(h1_df["high"], h1_df["low"], h1_df["close"], period=14)
         adx_h1 = float(adx_h1_series.iloc[-1]) if pd.notna(adx_h1_series.iloc[-1]) else 0.0
 
-        # Trend detection
         h1_trend = detect_trend_h1(h1_df)
         trend_source = "H1"
 
         if h1_trend is None:
-            # H1 ranging/unclear -> use M15 trend direction for signal bias
             m15_dir = detect_trend_m15_direction(m15_df)
             if m15_dir is None:
                 logger.info("No clear H1 trend and no clear M15 direction, skipping.")
@@ -394,33 +349,27 @@ def main():
             trend_source = "M15"
         else:
             trend_dir = h1_trend
-            # optional confirm (does not block; affects confidence only indirectly)
             _ = confirm_trend_m15(m15_df, trend_dir)
 
         trend_label = "LONG" if trend_dir == "LONG" else "SHORT"
 
-        # Market classifiers
         market_state = market_state_from_adx(adx_h1)
         trend_strength = trend_strength_from_adx(adx_h1)
         regime = market_regime(h1_df)
 
-        # News flag
         try:
             high_news = has_high_impact_news_nearby(now_utc)
         except Exception:
             high_news = False
 
-        # M5 Trigger (merged pullback/breakout/continuation)
         signal = trigger_signal_m5(cached_m5, trend_dir)
         if not signal:
             logger.info("No M5 trigger signal, sleeping %ss.", sleep_seconds)
             time.sleep(sleep_seconds)
             continue
 
-        # Dynamic TP/SL
         apply_dynamic_tp_sl(signal, h1_df)
 
-        # Confidence
         setup_type = signal.extra.get("setup_type", "GENERIC")
         adx_m5 = float(signal.extra.get("adx_m5", 0.0))
 
@@ -433,7 +382,6 @@ def main():
         )
         conf_text = confidence_label(conf)
 
-        # Message
         msg = build_signal_message(
             symbol_label=symbol_label,
             signal=signal,
@@ -449,8 +397,9 @@ def main():
             confidence_text=conf_text,
         )
 
-        # Send
+        # IMPORTANT: telegram_client MUST send with parse_mode=None (see fix below)
         telegram.send_message(msg)
+
         logger.info(
             "Signal processed. Trend source=%s direction=%s setup=%s confidence=%s (%s)",
             trend_source,
