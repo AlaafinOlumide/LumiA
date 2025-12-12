@@ -131,6 +131,5 @@ def has_high_impact_news_near(symbol: str, now_utc: dt.datetime, window_minutes:
             return True
 
     return False
-    def has_high_impact_news_nearby(now_utc):
-        return has_high_impact_news_near(now_utc)
+
 
