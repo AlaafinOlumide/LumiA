@@ -211,7 +211,7 @@ def main():
             time.sleep(60)
             continue
 
-        if time.time() - last_fetch > 180 or cached_m5 is None:
+        if time.time() - last_fetch > 120 or cached_m5 is None:
             cached_m5 = fetch_m5_ohlcv_twelvedata(
                 settings.xau_symbol_td, settings.twelvedata_api_key
             )
