@@ -7,9 +7,9 @@ import pandas as pd
 
 from config import load_settings
 from telegram_client import TelegramClient
+from data_fetcher import fetch_m5_ohlcv_twelvedata
 import indicators
 
-# Strategy (your updated one)
 from strategy import (
     is_within_sessions,
     detect_trend_h1,
@@ -17,9 +17,6 @@ from strategy import (
     confirm_trend_m15,
     trigger_signal_m5,
 )
-
-# Data fetcher (matches your earlier data_fetcher.py that uses Settings)
-from data_fetcher import fetch_m5_ohlcv_hybrid
 
 # Optional: news flag (do not crash deploy if names change)
 try:
@@ -45,14 +42,9 @@ logging.basicConfig(
 # Resampling (M5 -> M15/H1)
 # -------------------------
 def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """
-    rule: "15min" or "1h"
-    Expects df with a datetime column (UTC-ish) or datetime index.
-    """
     tmp = df.copy()
 
     if "datetime" in tmp.columns:
-        # Force UTC-aware timestamps (prevents weird future timestamps + resample issues)
         tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True, errors="coerce")
         tmp = tmp.dropna(subset=["datetime"]).set_index("datetime")
     else:
@@ -139,9 +131,6 @@ def market_regime(h1_df: pd.DataFrame) -> str:
 # Dynamic TP/SL (ATR-based)
 # -------------------------
 def tp_sl_multipliers(setup_type: str) -> Tuple[float, float, float]:
-    """
-    (sl_mult, tp1_mult, tp2_mult) on ATR(H1,14)
-    """
     if setup_type.startswith("PULLBACK"):
         return (0.90, 1.60, 2.60)
     if setup_type.startswith("BREAKOUT_CONT"):
@@ -152,7 +141,6 @@ def tp_sl_multipliers(setup_type: str) -> Tuple[float, float, float]:
 
 
 def apply_dynamic_tp_sl(signal, h1_df: pd.DataFrame) -> None:
-    # We only need ~20 H1 candles to compute ATR(14) safely
     if h1_df is None or len(h1_df) < 20:
         return
 
@@ -283,18 +271,26 @@ def build_signal_message(
     lines.append(f"Market State (H1): {market_state} (ADX {adx_h1:.2f})")
     lines.append(f"Trend Strength (H1): {trend_strength}")
     lines.append(f"Market Regime: {market_regime_text}")
-    lines.append("")
     if atr_h1 is not None:
         lines.append(f"ATR(H1,14): {float(atr_h1):.2f}")
     lines.append("")
     lines.append("HIGH-IMPACT NEWS NEARBY: expect extra volatility." if high_news else "No high-impact news flag near this time.")
-    lines.append(f"RSI(M5): {float(signal.extra.get('m5_rsi', 0.0)):.2f} | StochK(M5): {float(signal.extra.get('m5_stoch_k', 0.0)):.2f}")
-    lines.append(f"ADX(M5): {float(signal.extra.get('adx_m5', 0.0)):.2f} (+DI: {float(signal.extra.get('plus_di_m5', 0.0)):.2f}, -DI: {float(signal.extra.get('minus_di_m5', 0.0)):.2f})")
-    lines.append("BB(M5): upper {0:.2f}, mid {1:.2f}, lower {2:.2f}".format(
-        float(signal.extra.get("bb_upper", 0.0)),
-        float(signal.extra.get("bb_mid", 0.0)),
-        float(signal.extra.get("bb_lower", 0.0)),
-    ))
+    lines.append(
+        f"RSI(M5): {float(signal.extra.get('m5_rsi', 0.0)):.2f} | "
+        f"StochK(M5): {float(signal.extra.get('m5_stoch_k', 0.0)):.2f}"
+    )
+    lines.append(
+        f"ADX(M5): {float(signal.extra.get('adx_m5', 0.0)):.2f} "
+        f"(+DI: {float(signal.extra.get('plus_di_m5', 0.0)):.2f}, "
+        f"-DI: {float(signal.extra.get('minus_di_m5', 0.0)):.2f})"
+    )
+    lines.append(
+        "BB(M5): upper {0:.2f}, mid {1:.2f}, lower {2:.2f}".format(
+            float(signal.extra.get("bb_upper", 0.0)),
+            float(signal.extra.get("bb_mid", 0.0)),
+            float(signal.extra.get("bb_lower", 0.0)),
+        )
+    )
 
     return "\n".join(lines)
 
@@ -305,15 +301,18 @@ def build_signal_message(
 def main():
     settings = load_settings()
 
+    symbol_td = settings.xau_symbol_td  # "XAU/USD"
     symbol_label = "XAUUSD"
-    s1_start = settings.session_1_start
-    s1_end = settings.session_1_end
 
-    # Polling (how often the bot wakes up)
-    sleep_seconds = 30  # feels responsive; still respects candle-close logic
+    s1_start = settings.session_1_start  # 700
+    s1_end = settings.session_1_end      # 2000
 
-    # Fetch throttling (how often we call TwelveData)
-    fetch_interval_seconds = 180  # prevents API spam
+    # Poll loop cadence
+    sleep_seconds = 30  # checks often, but only evaluates on new M5 candle
+
+    # If you want "every 2 minutes", set to 120.
+    # Candle detection will still prevent duplicate evaluations.
+    fetch_interval_seconds = 120
 
     telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id)
 
@@ -340,10 +339,10 @@ def main():
         need_fetch = (time.time() - last_fetch_ts) >= fetch_interval_seconds or cached_m5 is None
         if need_fetch:
             logger.info("Fetching fresh M5 OHLCV data from Twelve Data...")
-            # Your fetcher currently uses Settings and returns M5 candles.
-            # IMPORTANT: ensure outputsize is large enough in data_fetcher (1000+),
-            # otherwise you won't have enough H1 history.
-            cached_m5 = fetch_m5_ohlcv_hybrid(settings)
+            cached_m5 = fetch_m5_ohlcv_twelvedata(
+                symbol=symbol_td,
+                api_key=settings.twelvedata_api_key,
+            )
             last_fetch_ts = time.time()
         else:
             logger.info("Using cached M5 OHLCV data.")
@@ -353,11 +352,18 @@ def main():
             time.sleep(sleep_seconds)
             continue
 
-        # --- NEW M5 candle detection ---
         cached_m5["datetime"] = pd.to_datetime(cached_m5["datetime"], utc=True, errors="coerce")
         cached_m5 = cached_m5.dropna(subset=["datetime"])
 
         current_last = cached_m5["datetime"].iloc[-1]
+
+        # Guard against “future” timestamps (should be fixed by timezone=UTC, but extra safe)
+        if current_last > pd.Timestamp(now_utc) + pd.Timedelta(minutes=2):
+            logger.warning("Latest candle looks future-dated (%s). Skipping this cycle.", current_last)
+            time.sleep(sleep_seconds)
+            continue
+
+        # New candle detection (only evaluate once per new close)
         if last_closed_candle_time is not None and current_last <= last_closed_candle_time:
             logger.info(
                 "No new M5 candle closed yet (last=%s, current=%s). Sleeping %ss...",
@@ -375,8 +381,9 @@ def main():
         m15_df = resample_ohlc(cached_m5, "15min")
         h1_df = resample_ohlc(cached_m5, "1h")
 
-        # Realistic minimums (do NOT require 60 H1 candles unless you fetch 60 hours of M5)
-        if h1_df is None or len(h1_df) < 20 or m15_df is None or len(m15_df) < 40:
+        # With outputsize=1200 you should generally have enough,
+        # but keep safe minimums to avoid edge cases
+        if h1_df is None or len(h1_df) < 60 or m15_df is None or len(m15_df) < 60:
             logger.info("Not enough data after resampling, sleeping %ss...", sleep_seconds)
             time.sleep(sleep_seconds)
             continue
@@ -390,7 +397,6 @@ def main():
         trend_source = "H1"
 
         if h1_trend is None:
-            # H1 ranging -> bias with M15 direction
             m15_dir = detect_trend_m15_direction(m15_df)
             if m15_dir is None:
                 logger.info("No clear H1 trend and no clear M15 direction, skipping.")
@@ -404,12 +410,11 @@ def main():
 
         trend_label = "LONG" if trend_dir == "LONG" else "SHORT"
 
-        # Market classifiers
         market_state = market_state_from_adx(adx_h1)
         trend_strength = trend_strength_from_adx(adx_h1)
         regime = market_regime(h1_df)
 
-        # News flag
+        # News flag (safe)
         high_news = False
         if _news_flag is not None:
             try:
@@ -417,7 +422,7 @@ def main():
             except Exception:
                 high_news = False
 
-        # M5 Trigger (your merged pullback/breakout/continuation)
+        # Trigger (pullback/breakout/continuation)
         signal = trigger_signal_m5(cached_m5, trend_dir)
         if not signal:
             logger.info("No M5 trigger signal on candle close, sleeping %ss.", sleep_seconds)
@@ -440,7 +445,7 @@ def main():
         )
         conf_text = confidence_label(conf)
 
-        # Message
+        # Send message
         msg = build_signal_message(
             symbol_label=symbol_label,
             signal=signal,
