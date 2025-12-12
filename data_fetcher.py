@@ -1,10 +1,6 @@
 import logging
-from typing import Optional
-
 import pandas as pd
 import requests
-
-from config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +14,7 @@ def fetch_ohlcv_twelvedata(
     outputsize: int = 300,
 ) -> pd.DataFrame:
     """
-    Fetch OHLCV data from Twelve Data and return as DataFrame sorted by time ascending.
+    Fetch OHLCV data from Twelve Data and return as DataFrame sorted ascending.
     interval example: "5min", "15min", "1h".
     """
     params = {
@@ -26,8 +22,10 @@ def fetch_ohlcv_twelvedata(
         "interval": interval,
         "apikey": api_key,
         "outputsize": outputsize,
+        "format": "JSON",
     }
     logger.info("Calling Twelve Data for %s interval %s", symbol, interval)
+
     r = requests.get(TD_BASE_URL, params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
@@ -36,12 +34,11 @@ def fetch_ohlcv_twelvedata(
         raise RuntimeError(f"Twelve Data response missing 'values': {data}")
 
     df = pd.DataFrame(data["values"])
-    # Ensure correct dtypes
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df["open"] = df["open"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["close"] = df["close"].astype(float)
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+
     if "volume" in df.columns:
         df["volume"] = df["volume"].astype(float)
     else:
@@ -51,21 +48,20 @@ def fetch_ohlcv_twelvedata(
     return df
 
 
-def fetch_m5_ohlcv_hybrid(settings: Settings) -> pd.DataFrame:
+def fetch_m5_ohlcv_twelvedata(
+    symbol: str,
+    api_key: str,
+    outputsize: int = 300,
+) -> pd.DataFrame:
     """
-    Previously: yfinance primary, Twelve Data fallback.
-    Now: Twelve Data ONLY (XAU/USD, 5min).
-
-    Kept the function name the same so main.py does not need to change imports.
+    M5-only convenience wrapper (keeps your main.py import working).
     """
-    if not settings.twelvedata_api_key:
+    if not api_key:
         raise RuntimeError("Twelve Data API key missing; cannot fetch data.")
 
-    df_td = fetch_ohlcv_twelvedata(
-        api_key=settings.twelvedata_api_key,
-        symbol=settings.xau_symbol_td,  # e.g. "XAU/USD"
+    return fetch_ohlcv_twelvedata(
+        api_key=api_key,
+        symbol=symbol,
         interval="5min",
-        outputsize=300,  # ~25 hours of 5m candles
+        outputsize=outputsize,
     )
-    logger.info("Using Twelve Data data for symbol %s", settings.xau_symbol_td)
-    return df_td
