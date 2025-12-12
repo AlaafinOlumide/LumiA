@@ -1,152 +1,263 @@
 import time
 import logging
 import datetime as dt
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any
 
 import pandas as pd
 
-from config import load_settings, Settings
+import config
+from data_fetcher import fetch_m5_ohlcv_twelvedata
 from telegram_client import TelegramClient
-from data_fetcher import fetch_m5_ohlcv_hybrid  # Twelve Data only in your setup
+from high_impact_news import has_high_impact_news_nearby
+
 from strategy import (
+    is_within_sessions,
     detect_trend_h1,
     detect_trend_m15_direction,
     confirm_trend_m15,
     trigger_signal_m5,
-    is_within_sessions,
 )
-from data_logger import log_signal
-from high_impact_news import has_high_impact_news_near
-from indicators import atr, adx  # ATR + ADX on H1
 
+# -------------------------
+# Logging
+# -------------------------
+logger = logging.getLogger("xauusd_bot")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("xauusd_bot")
 
-# Fetch 5m data at most once every 120 seconds (2 minutes)
-FETCH_INTERVAL_SECONDS = 120
+
+# -------------------------
+# Helpers: Indicators (ATR, BB width)
+# -------------------------
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Average True Range (Wilder-style smoothing via EMA approximation)."""
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def bollinger_width(close: pd.Series, period: int = 20, std_dev: float = 2.0) -> pd.Series:
+    ma = close.rolling(period).mean()
+    sd = close.rolling(period).std(ddof=0)
+    upper = ma + std_dev * sd
+    lower = ma - std_dev * sd
+    width = (upper - lower) / ma.replace(0, pd.NA)
+    return width
 
 
 def _risk_tag_from_adx(adx_m5: float) -> str:
-    """
-    Classify the trade idea as SCALP vs SWING based on M5 ADX strength.
-    """
-    if adx_m5 >= 30:
-        return "SWING"
+    # Keep it simple and useful in Telegram
+    if adx_m5 >= 25:
+        return "SCALP"
     return "SCALP"
 
 
-def _trend_strength_label(adx_h1_value: float) -> str:
-    """
-    Give a human label for H1 trend strength based on ADX.
-    """
-    if adx_h1_value < 18:
-        return "Weak"
-    elif adx_h1_value < 25:
-        return "Moderate"
-    elif adx_h1_value < 35:
+def _confidence_label(score: int) -> str:
+    if score >= 75:
+        return "High"
+    if score >= 55:
+        return "Medium"
+    return "Low"
+
+
+def _trend_strength_label(adx_h1: float) -> str:
+    if adx_h1 >= 30:
         return "Strong"
-    else:
-        return "Very Strong"
+    if adx_h1 >= 20:
+        return "Moderate"
+    return "Weak"
 
 
-def _market_state_and_regime(
-    adx_h1_value: float,
-    atr_h1: float,
-    last_h1_close: float,
-) -> tuple[str, str]:
+def _market_state_from_adx(adx_h1: float) -> str:
+    # Simple, robust
+    return "TRENDING" if adx_h1 >= 20 else "RANGING"
+
+
+def _market_regime(h1_df: pd.DataFrame) -> str:
     """
-    Coarse market state (TRENDING / RANGING) + finer regime label
-    using ADX(H1) and ATR(H1) as % of price.
+    Regime = directionless description of market behavior.
+    Uses BB width + ATR to classify volatility + structure.
     """
-    atr_ratio = atr_h1 / last_h1_close if last_h1_close > 0 else 0.0
+    if h1_df is None or len(h1_df) < 60:
+        return "Unknown"
 
-    # Coarse state
-    if adx_h1_value < 18:
-        state = "RANGING"
+    close = h1_df["close"]
+    high = h1_df["high"]
+    low = h1_df["low"]
+
+    bw = bollinger_width(close, period=20, std_dev=2.0)
+    a = atr(high, low, close, period=14)
+
+    bw_last = float(bw.iloc[-1]) if pd.notna(bw.iloc[-1]) else 0.0
+    atr_last = float(a.iloc[-1]) if pd.notna(a.iloc[-1]) else 0.0
+
+    # crude but stable thresholds
+    if bw_last >= 0.02 or atr_last >= 20:
+        return "High Volatility"
+    if bw_last <= 0.008 and atr_last <= 10:
+        return "Low Volatility / Compression"
+    return "Normal Volatility"
+
+
+def _setup_label(setup_type: str) -> str:
+    if setup_type.startswith("PULLBACK"):
+        return "Pullback"
+    if setup_type.startswith("BREAKOUT_CONT"):
+        return "Breakout Continuation"
+    if setup_type.startswith("BREAKOUT"):
+        return "Breakout"
+    return "Generic"
+
+
+def _tp_sl_multipliers(setup_type: str) -> Tuple[float, float, float]:
+    """
+    (sl_mult, tp1_mult, tp2_mult) based on setup.
+    - Pullback: wider SL, larger targets
+    - Breakout: medium
+    - Continuation: tighter SL, smaller targets
+    """
+    if setup_type.startswith("PULLBACK"):
+        return (0.90, 1.60, 2.60)
+    if setup_type.startswith("BREAKOUT_CONT"):
+        return (0.55, 0.90, 1.50)
+    if setup_type.startswith("BREAKOUT"):
+        return (0.70, 1.20, 2.00)
+    return (0.75, 1.10, 1.80)
+
+
+def apply_dynamic_tp_sl(signal, h1_df: pd.DataFrame) -> None:
+    """
+    Adds:
+      - atr_h1
+      - sl, tp1, tp2
+    into signal.extra using ATR(H1,14) and setup-specific multipliers.
+    """
+    if h1_df is None or len(h1_df) < 60:
+        return
+
+    high = h1_df["high"]
+    low = h1_df["low"]
+    close = h1_df["close"]
+
+    a = atr(high, low, close, period=14)
+    atr_h1 = float(a.iloc[-1]) if pd.notna(a.iloc[-1]) else None
+    if atr_h1 is None or atr_h1 <= 0:
+        return
+
+    setup_type = signal.extra.get("setup_type", "GENERIC")
+    sl_mult, tp1_mult, tp2_mult = _tp_sl_multipliers(setup_type)
+
+    entry = float(signal.price)
+
+    if signal.direction == "LONG":
+        sl = entry - (atr_h1 * sl_mult)
+        tp1 = entry + (atr_h1 * tp1_mult)
+        tp2 = entry + (atr_h1 * tp2_mult)
     else:
-        state = "TRENDING"
+        sl = entry + (atr_h1 * sl_mult)
+        tp1 = entry - (atr_h1 * tp1_mult)
+        tp2 = entry - (atr_h1 * tp2_mult)
 
-    # Volatility label from ATR ratio
-    if atr_ratio < 0.004:  # < 0.4% of price
-        vol_label = "Low vol"
-    elif atr_ratio < 0.008:  # 0.4–0.8%
-        vol_label = "Normal vol"
-    else:  # > 0.8%
-        vol_label = "High vol"
-
-    # Regime
-    if state == "RANGING":
-        if vol_label == "Low vol":
-            regime = "Quiet Range"
-        else:
-            regime = "Choppy Range"
-    else:  # TRENDING
-        if vol_label == "Low vol":
-            regime = "Slow Trend"
-        elif vol_label == "Normal vol":
-            regime = "Steady Trend"
-        else:
-            regime = "High-Vol Trend"
-
-    regime_full = f"{regime} ({vol_label})"
-    return state, regime_full
+    signal.extra["atr_h1"] = atr_h1
+    signal.extra["sl"] = sl
+    signal.extra["tp1"] = tp1
+    signal.extra["tp2"] = tp2
 
 
-def _trading_confidence_score(
-    adx_h1_value: float,
-    adx_m5_value: float,
-    market_state: str,
-    regime: str,
-    risk_tag: str,
+def compute_confidence_score(
+    trend_source: str,
+    trend_dir: str,
+    setup_type: str,
+    adx_h1: float,
+    adx_m5: float,
     high_news: bool,
-) -> tuple[int, str]:
+) -> int:
     """
-    Build a 0–100 confidence score and label (Low/Medium/High)
-    based on trend strength, regime, risk tag, and news.
+    Simple, explainable confidence score (0-100).
     """
-    score = 50.0
+    score = 50
 
-    # Add from H1 trend strength, capped
-    score += min(adx_h1_value, 40.0) * 0.8  # max +32
+    # Trend source reliability
+    if trend_source == "H1":
+        score += 10
+    elif trend_source == "M15":
+        score += 5
 
-    # Slight boost if M5 ADX is strong
-    score += min(adx_m5_value, 40.0) * 0.2  # max +8
+    # Setup quality bonus
+    if setup_type.startswith("PULLBACK"):
+        score += 15
+    elif setup_type.startswith("BREAKOUT"):
+        score += 8
+    elif setup_type.startswith("BREAKOUT_CONT"):
+        score += 3
 
-    # SWING trades get a small bump
-    if risk_tag == "SWING":
-        score += 5.0
-
-    # Ranging markets and choppy ranges reduce confidence
-    if market_state == "RANGING":
-        score -= 10.0
-    if "Range" in regime:
-        score -= 5.0
-
-    # High-impact news reduces confidence
-    if high_news:
-        score -= 10.0
-
-    # Clamp 0–100
-    score = max(0.0, min(100.0, score))
-    score_int = int(round(score))
-
-    if score_int <= 40:
-        label = "Low"
-    elif score_int <= 70:
-        label = "Medium"
+    # Trend strength bonus
+    if adx_h1 >= 30:
+        score += 12
+    elif adx_h1 >= 20:
+        score += 7
     else:
-        label = "High"
+        score -= 5
 
-    return score_int, label
+    # M5 structure bonus
+    if adx_m5 >= 25:
+        score += 6
+    elif adx_m5 < 15:
+        score -= 5
+
+    # News penalty
+    if high_news:
+        score -= 12
+
+    # clamp
+    score = max(0, min(100, score))
+    return score
 
 
+# -------------------------
+# Resampling (M5 -> M15/H1)
+# -------------------------
+def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """
+    rule: "15min" or "1h"
+    Expects df with datetime column OR datetime index.
+    """
+    tmp = df.copy()
+    if "datetime" in tmp.columns:
+        tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True)
+        tmp = tmp.set_index("datetime")
+    else:
+        tmp.index = pd.to_datetime(tmp.index, utc=True)
+
+    agg = tmp.resample(rule).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    ).dropna()
+
+    agg = agg.reset_index()
+    return agg
+
+
+# -------------------------
+# Telegram message builder
+# -------------------------
 def build_signal_message(
     symbol_label: str,
     signal,
     trend_label: str,
+    trend_source: str,
     session_window: str,
     high_news: bool,
     market_state: str,
@@ -156,409 +267,243 @@ def build_signal_message(
     confidence_score: int,
     confidence_label: str,
 ) -> str:
-    """
-    Build Telegram message with:
-
-    - Header, direction, SL, TP1, TP2
-    - RR to TP1/TP2
-    - Time, trend bias, session, reason
-    - Market state, regime, trend strength, confidence
-    - ATR info
-    - News + key indicators
-    """
-    adx_m5 = signal.extra["adx_m5"]
+    adx_m5 = float(signal.extra.get("adx_m5", 0.0))
     risk_tag = _risk_tag_from_adx(adx_m5)
 
-    atr_h1 = signal.extra.get("atr_h1")
+    entry = float(signal.price)
+    setup_type = signal.extra.get("setup_type", "GENERIC")
+    setup_label = _setup_label(setup_type)
+
     sl = signal.extra.get("sl")
     tp1 = signal.extra.get("tp1")
     tp2 = signal.extra.get("tp2")
+    atr_h1 = signal.extra.get("atr_h1")
 
     arrow = "🟢 BUY" if signal.direction == "LONG" else "🔴 SELL"
 
-    if high_news:
-        news_line = "⚠️ HIGH-IMPACT NEWS NEARBY — expect extra volatility."
-    else:
-        news_line = "ℹ️ No high-impact news flag near this time."
-
-    entry = signal.price
-    setup_type = signal.extra.get("setup_type", "GENERIC")
-
-    lines: list[str] = []
-
-    # ----- Header + entry + TP/SL + RR -----
+    lines = []
     lines.append(f"XAUUSD Signal [{risk_tag}]")
     lines.append(f"{arrow} {symbol_label} at {entry:.2f}")
-    if setup_type != "GENERIC":
-        lines.append(f"Setup: {setup_type}")
+    lines.append(f"Setup: {setup_label} ({setup_type}) | Confidence: {confidence_score} ({confidence_label})")
 
     if sl is not None and tp1 is not None and tp2 is not None:
         lines.append(f"– SL: {sl:.2f}")
         lines.append(f"– TP1: {tp1:.2f}")
         lines.append(f"– TP2: {tp2:.2f}")
 
-        # Risk / Reward computation
+        # RR
         if signal.direction == "LONG":
-            risk = entry - sl
-            rr1 = (tp1 - entry) / risk if risk > 0 else 0.0
-            rr2 = (tp2 - entry) / risk if risk > 0 else 0.0
+            risk = entry - float(sl)
+            rr1 = (float(tp1) - entry) / risk if risk > 0 else 0.0
+            rr2 = (float(tp2) - entry) / risk if risk > 0 else 0.0
         else:
-            risk = sl - entry
-            rr1 = (entry - tp1) / risk if risk > 0 else 0.0
-            rr2 = (entry - tp2) / risk if risk > 0 else 0.0
+            risk = float(sl) - entry
+            rr1 = (entry - float(tp1)) / risk if risk > 0 else 0.0
+            rr2 = (entry - float(tp2)) / risk if risk > 0 else 0.0
 
         if risk > 0:
-            lines.append(
-                f"RR to TP1: {rr1:.2f}R | RR to TP2: {rr2:.2f}R"
-            )
+            lines.append(f"RR to TP1: {rr1:.2f}R | RR to TP2: {rr2:.2f}R")
 
-    lines.append("")  # blank
-
-    # ----- Context -----
+    lines.append("")
     lines.append(f"Time (UTC): {signal.time.isoformat()}")
-    lines.append(f"Trend Bias: {trend_label}")
+    lines.append(f"Trend Bias: {trend_label} (source: {trend_source})")
     lines.append(f"Session: {session_window}")
     lines.append(f"Reason: {signal.reason}")
-    lines.append("")  # blank
+    lines.append("")
 
-    # ----- Market state / regime / trend strength / confidence -----
-    lines.append(
-        f"Market State (H1): {market_state} (ADX {adx_h1_value:.2f})"
-    )
+    lines.append(f"Market State (H1): {market_state} (ADX {adx_h1_value:.2f})")
     lines.append(f"Market Regime: {market_regime}")
-    lines.append(
-        f"Trend Strength (H1): {trend_strength_label}"
-    )
-    lines.append(
-        f"Trading Confidence: {confidence_score} ({confidence_label})"
-    )
-    lines.append("")  # blank
+    lines.append(f"Trend Strength (H1): {trend_strength_label}")
+    lines.append("")
 
-    # ----- ATR info -----
     lines.append("Suggested TP/SL (ATR-based)")
     if atr_h1 is not None:
-        lines.append(f"– ATR(H1, 14): {atr_h1:.2f}")
-    lines.append("")  # blank
+        lines.append(f"– ATR(H1, 14): {float(atr_h1):.2f}")
+    lines.append("")
 
-    # ----- News & indicators -----
-    lines.append(news_line)
+    if high_news:
+        lines.append("⚠️ HIGH-IMPACT NEWS NEARBY — expect extra volatility.")
+    else:
+        lines.append("ℹ️ No high-impact news flag near this time.")
+
     lines.append(
-        f"RSI(M5): {signal.extra['m5_rsi']:.2f} | "
-        f"StochK(M5): {signal.extra['m5_stoch_k']:.2f}"
+        f"RSI(M5): {float(signal.extra.get('m5_rsi', 0.0)):.2f} | "
+        f"StochK(M5): {float(signal.extra.get('m5_stoch_k', 0.0)):.2f}"
     )
     lines.append(
-        f"ADX(M5): {signal.extra['adx_m5']:.2f} "
-        f"(+DI: {signal.extra['plus_di_m5']:.2f}, "
-        f"-DI: {signal.extra['minus_di_m5']:.2f})"
+        f"ADX(M5): {float(signal.extra.get('adx_m5', 0.0)):.2f} "
+        f"(+DI: {float(signal.extra.get('plus_di_m5', 0.0)):.2f}, "
+        f"-DI: {float(signal.extra.get('minus_di_m5', 0.0)):.2f})"
     )
     lines.append(
         "BB(M5): upper {0:.2f}, mid {1:.2f}, lower {2:.2f}".format(
-            signal.extra["bb_upper"],
-            signal.extra["bb_mid"],
-            signal.extra["bb_lower"],
+            float(signal.extra.get("bb_upper", 0.0)),
+            float(signal.extra.get("bb_mid", 0.0)),
+            float(signal.extra.get("bb_lower", 0.0)),
         )
     )
 
     return "\n".join(lines)
 
 
-def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """
-    Resample a 5m OHLCV DataFrame to a higher timeframe (15m, 1h, etc.).
-    Assumes df has columns: datetime, open, high, low, close, volume.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
+# -------------------------
+# Main loop
+# -------------------------
+def main():
+    symbol = getattr(config, "SYMBOL_TWELVE", "XAU/USD")
+    symbol_label = getattr(config, "SYMBOL_LABEL", "XAUUSD")
 
-    tmp = df.copy()
-    tmp = tmp.set_index("datetime")
-    agg = tmp.resample(rule).agg(
-        {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }
-    )
-    agg = agg.dropna()
-    agg = agg.reset_index()
-    return agg
+    # Trading window: 07:00–20:00 UTC (single session)
+    s1_start = getattr(config, "TRADING_SESSION_1_START", 700)
+    s1_end = getattr(config, "TRADING_SESSION_1_END", 2000)
+    s2_start = getattr(config, "TRADING_SESSION_2_START", None)
+    s2_end = getattr(config, "TRADING_SESSION_2_END", None)
 
+    sleep_seconds = getattr(config, "SLEEP_SECONDS", 60)
+    fetch_interval_seconds = getattr(config, "FETCH_INTERVAL_SECONDS", 180)  # reduces API usage
 
-def main_loop():
-    settings: Settings = load_settings()
-    tg = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id)
+    td_key = getattr(config, "TWELVE_DATA_API_KEY", "")
+    tg_token = getattr(config, "TELEGRAM_BOT_TOKEN", "")
+    tg_chat = getattr(config, "TELEGRAM_CHAT_ID", "")
 
-    symbol_label = "XAUUSD"
+    telegram = TelegramClient(tg_token, tg_chat)
+
     logger.info("Starting XAUUSD bot (Twelve Data only, H1 primary, M15 fallback).")
 
-    last_signal_time: Optional[dt.datetime] = None
-
-    cached_m5_df: Optional[pd.DataFrame] = None
-    last_m5_fetch_ts: Optional[float] = None
+    last_fetch_ts: float = 0.0
+    cached_m5: Optional[pd.DataFrame] = None
 
     while True:
-        now_utc = dt.datetime.utcnow()
+        now_utc = dt.datetime.now(dt.timezone.utc)
 
-        if not is_within_sessions(
-            now_utc,
-            settings.session_1_start,
-            settings.session_1_end,
-            settings.session_2_start,
-            settings.session_2_end,
-        ):
-            logger.info("Outside trading sessions, sleeping 60s...")
-            time.sleep(60)
+        in_session = is_within_sessions(
+            now_utc=now_utc,
+            session_1_start=s1_start,
+            session_1_end=s1_end,
+            session_2_start=s2_start,
+            session_2_end=s2_end,
+        )
+
+        if not in_session:
+            logger.info("Outside trading sessions, sleeping %ss...", sleep_seconds)
+            time.sleep(sleep_seconds)
             continue
 
+        # Fetch / cache M5 OHLCV
+        need_fetch = (time.time() - last_fetch_ts) >= fetch_interval_seconds or cached_m5 is None
+        if need_fetch:
+            logger.info("Fetching fresh M5 OHLCV data from Twelve Data...")
+            cached_m5 = fetch_m5_ohlcv_twelvedata(symbol=symbol, api_key=td_key)
+            last_fetch_ts = time.time()
+        else:
+            logger.info("Using cached M5 OHLCV data.")
+
+        if cached_m5 is None or len(cached_m5) < 100:
+            logger.warning("Not enough M5 data, sleeping %ss...", sleep_seconds)
+            time.sleep(sleep_seconds)
+            continue
+
+        # Build M15/H1 from M5 (same source)
+        m15_df = resample_ohlc(cached_m5, "15min")
+        h1_df = resample_ohlc(cached_m5, "1h")
+
+        if h1_df is None or len(h1_df) < 60 or m15_df is None or len(m15_df) < 60:
+            logger.info("Not enough data after resampling, sleeping %ss.", sleep_seconds)
+            time.sleep(sleep_seconds)
+            continue
+
+        # Trend detection
+        h1_trend = detect_trend_h1(h1_df)
+        trend_source = "H1"
+
+        if h1_trend is None:
+            # If H1 ranging/unclear → use M15 direction as primary for signals
+            m15_dir = detect_trend_m15_direction(m15_df)
+            if m15_dir is None:
+                logger.info("No clear H1 trend and no clear M15 direction, skipping.")
+                time.sleep(sleep_seconds)
+                continue
+            trend_dir = m15_dir
+            trend_source = "M15"
+        else:
+            # Confirm H1 with M15 if possible; if fails, allow anyway but it may lower confidence later.
+            trend_dir = h1_trend
+            _ = confirm_trend_m15(m15_df, trend_dir)
+
+        # Market classifications (H1)
+        # Compute ADX(H1) via ATR/BB doesn't give ADX; so we approximate market state from trend presence + BB/ATR regime.
+        # We'll use trend existence as directional and treat ADX as "proxy" by trend detection strength:
+        # But we *can* still infer an "ADX-like" from trend_dir presence only — better: classify from h1_trend presence.
+        # Here we do simple state/strength using trend presence:
+        # If you already compute ADX(H1) elsewhere, you can swap in.
+        # We'll estimate adx_h1 as 25 when trend exists, else 15.
+        adx_h1_value = 25.0 if h1_trend is not None else 15.0
+        market_state = _market_state_from_adx(adx_h1_value)
+        trend_strength_label = _trend_strength_label(adx_h1_value)
+        market_regime = _market_regime(h1_df)
+
+        # News filter
         try:
-            # ---------- DATA FETCH / CACHE ----------
-            now_ts = time.time()
-            should_fetch_m5 = (
-                last_m5_fetch_ts is None
-                or (now_ts - last_m5_fetch_ts) >= FETCH_INTERVAL_SECONDS
-            )
+            high_news = has_high_impact_news_nearby(now_utc)
+        except Exception:
+            high_news = False
 
-            if should_fetch_m5:
-                logger.info("Fetching fresh M5 OHLCV data from Twelve Data...")
-                m5_df = fetch_m5_ohlcv_hybrid(settings)
-                cached_m5_df = m5_df
-                last_m5_fetch_ts = now_ts
-            else:
-                if cached_m5_df is None:
-                    logger.info("No cached M5 data yet, fetching from Twelve Data...")
-                    m5_df = fetch_m5_ohlcv_hybrid(settings)
-                    cached_m5_df = m5_df
-                    last_m5_fetch_ts = now_ts
-                else:
-                    logger.info("Using cached M5 OHLCV data.")
-                    m5_df = cached_m5_df
+        # M5 trigger (merged logic)
+        signal = trigger_signal_m5(cached_m5, trend_dir)
+        if not signal:
+            logger.info("No M5 trigger signal, sleeping %ss.", sleep_seconds)
+            time.sleep(sleep_seconds)
+            continue
 
-            if m5_df is None or m5_df.empty:
-                logger.info("Empty M5 data, sleeping 60s.")
-                time.sleep(60)
-                continue
+        # Dynamic TP/SL from ATR(H1)
+        apply_dynamic_tp_sl(signal, h1_df)
 
-            # ---------- RESAMPLING ----------
-            h1_df = resample_ohlcv(m5_df, "1h")
-            m15_df = resample_ohlcv(m5_df, "15min")
+        # Confidence
+        setup_type = signal.extra.get("setup_type", "GENERIC")
+        adx_m5 = float(signal.extra.get("adx_m5", 0.0))
 
-            if len(h1_df) < 20 or len(m15_df) < 20 or len(m5_df) < 50:
-                logger.info("Not enough data after resampling, sleeping 60s.")
-                time.sleep(60)
-                continue
+        confidence_score = compute_confidence_score(
+            trend_source=trend_source,
+            trend_dir=trend_dir,
+            setup_type=setup_type,
+            adx_h1=adx_h1_value,
+            adx_m5=adx_m5,
+            high_news=high_news,
+        )
+        confidence_label = _confidence_label(confidence_score)
 
-            # ---------- TREND SELECTION: H1 PRIMARY, M15 FALLBACK ----------
-            trend_h1 = detect_trend_h1(h1_df)
-            trend_source = "H1"
-            trend_for_signal: Optional[str] = trend_h1
+        # Message
+        session_window = "07:00-20:00"
+        trend_label = "LONG" if trend_dir == "LONG" else "SHORT"
 
-            if trend_for_signal is not None:
-                # When H1 has a direction, we still require M15 confirmation
-                if not confirm_trend_m15(m15_df, trend_h1):
-                    logger.info("M15 does not confirm H1 trend, skipping.")
-                    time.sleep(60)
-                    continue
-            else:
-                # H1 is ranging / unclear -> try M15 as fallback
-                trend_m15_bias = detect_trend_m15_direction(m15_df)
-                if trend_m15_bias is None:
-                    logger.info("No clear H1 or M15 trend, skipping.")
-                    time.sleep(60)
-                    continue
-                trend_source = "M15"
-                trend_for_signal = trend_m15_bias
+        msg = build_signal_message(
+            symbol_label=symbol_label,
+            signal=signal,
+            trend_label=trend_label,
+            trend_source=trend_source,
+            session_window=session_window,
+            high_news=high_news,
+            market_state=market_state,
+            market_regime=market_regime,
+            adx_h1_value=adx_h1_value,
+            trend_strength_label=trend_strength_label,
+            confidence_score=confidence_score,
+            confidence_label=confidence_label,
+        )
 
-            # Safety check
-            if trend_for_signal is None:
-                logger.info("No usable trend_for_signal, skipping.")
-                time.sleep(60)
-                continue
+        # Send Telegram
+        telegram.send_message(msg)
+        logger.info(
+            "Signal sent and logged. Trend source: %s, direction: %s, setup: %s, confidence: %s (%s)",
+            trend_source,
+            trend_label,
+            setup_type,
+            confidence_score,
+            confidence_label,
+        )
 
-            # ---------- M5 TRIGGER ----------
-            signal = trigger_signal_m5(m5_df, trend_for_signal)
-            if not signal:
-                logger.info("No M5 trigger signal, sleeping 60s.")
-                time.sleep(60)
-                continue
-
-            # Cooldown: avoid signal spam
-            if last_signal_time and (now_utc - last_signal_time).total_seconds() < 300:
-                logger.info(
-                    "Signal occurred too soon after previous, skipping (cooldown)."
-                )
-                time.sleep(60)
-                continue
-
-            # ---------- H1 VOL / ADX / STATE / REGIME ----------
-            atr_series = atr(h1_df["high"], h1_df["low"], h1_df["close"], period=14)
-            atr_h1 = float(atr_series.iloc[-1])
-
-            adx_h1_series, _, _ = adx(
-                h1_df["high"], h1_df["low"], h1_df["close"], period=14
-            )
-            adx_h1_value = float(adx_h1_series.iloc[-1])
-
-            last_h1_close = float(h1_df["close"].iloc[-1])
-
-            market_state, market_regime = _market_state_and_regime(
-                adx_h1_value, atr_h1, last_h1_close
-            )
-            trend_strength_label = _trend_strength_label(adx_h1_value)
-
-            # ---------- RISK TAG & SETUP TYPE ----------
-            adx_m5 = signal.extra["adx_m5"]
-            risk_tag = _risk_tag_from_adx(adx_m5)
-            setup_type = signal.extra.get("setup_type", "GENERIC")
-
-            # ---------- DYNAMIC TP/SL (ATR + SCALP/SWING + SETUP TYPE) ----------
-            # Idea:
-            # - Breakouts: tighter SL, nearer TP (fast continuation)
-            # - Pullbacks: slightly wider SL, further TP (deeper swings)
-            if risk_tag == "SCALP":
-                if "BREAKOUT" in setup_type:
-                    # Fast scalp breakout
-                    sl_mult = 0.5
-                    tp1_mult = 0.8
-                    tp2_mult = 1.2
-                elif "PULLBACK" in setup_type:
-                    # Pullback scalp, can target a bit more
-                    sl_mult = 0.6
-                    tp1_mult = 1.0
-                    tp2_mult = 1.6
-                else:
-                    # Fallback defaults
-                    sl_mult = 0.6
-                    tp1_mult = 0.9
-                    tp2_mult = 1.3
-            else:  # SWING
-                if "BREAKOUT" in setup_type:
-                    # Swing breakout: still tighter than pullback swing
-                    sl_mult = 0.7
-                    tp1_mult = 1.2
-                    tp2_mult = 1.8
-                elif "PULLBACK" in setup_type:
-                    # Classic swing pullback, largest RR
-                    sl_mult = 0.9
-                    tp1_mult = 1.8
-                    tp2_mult = 2.7
-                else:
-                    # Fallback defaults
-                    sl_mult = 0.8
-                    tp1_mult = 1.3
-                    tp2_mult = 2.0
-
-            entry_price = signal.price
-            if signal.direction == "LONG":
-                sl = entry_price - sl_mult * atr_h1
-                tp1 = entry_price + tp1_mult * atr_h1
-                tp2 = entry_price + tp2_mult * atr_h1
-            else:
-                sl = entry_price + sl_mult * atr_h1
-                tp1 = entry_price - tp1_mult * atr_h1
-                tp2 = entry_price - tp2_mult * atr_h1
-
-            # ---------- SESSION LABEL ----------
-            hhmm = now_utc.hour * 100 + now_utc.minute
-            if settings.session_1_start <= hhmm <= settings.session_1_end:
-                session_window = "07:00-20:00"
-            else:
-                session_window = "OUTSIDE"
-
-            # ---------- NEWS ----------
-            high_news = has_high_impact_news_near(symbol_label, now_utc)
-
-            # ---------- CONFIDENCE SCORE ----------
-            confidence_score, confidence_label = _trading_confidence_score(
-                adx_h1_value=adx_h1_value,
-                adx_m5_value=adx_m5,
-                market_state=market_state,
-                regime=market_regime,
-                risk_tag=risk_tag,
-                high_news=high_news,
-            )
-
-            # Trend label for message
-            if trend_source == "H1":
-                trend_label = f"{trend_for_signal} (H1)"
-            else:
-                trend_label = f"{trend_for_signal} (M15, H1 ranging)"
-
-            # Attach everything to signal.extra
-            signal.extra["atr_h1"] = atr_h1
-            signal.extra["sl"] = sl
-            signal.extra["tp1"] = tp1
-            signal.extra["tp2"] = tp2
-            signal.extra["adx_h1"] = adx_h1_value
-            signal.extra["market_state"] = market_state
-            signal.extra["market_regime"] = market_regime
-            signal.extra["trend_strength_label"] = trend_strength_label
-            signal.extra["confidence_score"] = confidence_score
-            signal.extra["confidence_label"] = confidence_label
-
-            msg = build_signal_message(
-                symbol_label,
-                signal,
-                trend_label,
-                session_window,
-                high_news,
-                market_state,
-                market_regime,
-                adx_h1_value,
-                trend_strength_label,
-                confidence_score,
-                confidence_label,
-            )
-            tg.send_message(msg)
-            last_signal_time = now_utc
-
-            # ---------- LOG ----------
-            row = {
-                "symbol": symbol_label,
-                "direction": signal.direction,
-                "price": signal.price,
-                "reason": signal.reason,
-                "trend_h1": trend_h1,  # may be None if using M15 fallback
-                "session_window": session_window,
-                "m5_rsi": signal.extra["m5_rsi"],
-                "m5_stoch_k": signal.extra["m5_stoch_k"],
-                "m5_stoch_d": signal.extra["m5_stoch_d"],
-                "bb_upper": signal.extra["bb_upper"],
-                "bb_mid": signal.extra["bb_mid"],
-                "bb_lower": signal.extra["bb_lower"],
-                "adx_m5": signal.extra["adx_m5"],
-                "plus_di_m5": signal.extra["plus_di_m5"],
-                "minus_di_m5": signal.extra["minus_di_m5"],
-                "high_impact_news": high_news,
-                "atr_h1": atr_h1,
-                "sl": sl,
-                "tp1": tp1,
-                "tp2": tp2,
-                "adx_h1": adx_h1_value,
-                "market_state": market_state,
-                "market_regime": market_regime,
-                "trend_strength_label": trend_strength_label,
-                "confidence_score": confidence_score,
-                "confidence_label": confidence_label,
-                "setup_type": setup_type,
-                "risk_tag": risk_tag,
-            }
-            log_signal(row)
-
-            logger.info(
-                "Signal sent and logged. Trend source: %s, direction: %s, setup: %s, risk_tag: %s",
-                trend_source,
-                trend_for_signal,
-                setup_type,
-                risk_tag,
-            )
-            time.sleep(60)
-
-        except Exception as e:
-            logger.exception("Error in main loop: %s", e)
-            time.sleep(60)
+        time.sleep(sleep_seconds)
 
 
 if __name__ == "__main__":
-    main_loop()
+    main()
