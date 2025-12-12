@@ -371,7 +371,7 @@ def main():
         else:
             logger.info("Using cached M5 OHLCV data.")
 
-        if cached_m5 is None or len(cached_m5) < 120:
+        if cached_m5 is None or len(cached_m5) < 900:
             logger.warning("Not enough M5 data yet. Sleeping %ss...", loop_sleep_seconds)
             time.sleep(loop_sleep_seconds)
             continue
