@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from indicators import bollinger_bands, rsi, stochastic, adx
+from indicators import bollinger_bands, rsi, stochastic_oscillator, adx, bullish_engulfing, bearish_engulfing
 
 
 @dataclass
@@ -72,9 +72,9 @@ def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
     e20 = float(ema20.iloc[-1])
     e50 = float(ema50.iloc[-1])
     r = float(rsi_series.iloc[-1])
-    a = float(adx_series.iloc[-1])
+    a = float(adx_series.iloc[-1]) if pd.notna(adx_series.iloc[-1]) else 0.0
 
-    # basic filters
+    # basic filters (if ADX weak -> ranging)
     if a < 15:
         return None
 
@@ -110,7 +110,7 @@ def detect_trend_m15_direction(m15_df: pd.DataFrame) -> Optional[str]:
     e20 = float(ema20.iloc[-1])
     e50 = float(ema50.iloc[-1])
     r = float(rsi_series.iloc[-1])
-    a = float(adx_series.iloc[-1])
+    a = float(adx_series.iloc[-1]) if pd.notna(adx_series.iloc[-1]) else 0.0
 
     if a < 12:
         return None
@@ -155,16 +155,12 @@ def confirm_trend_m15(m15_df: pd.DataFrame, trend: str) -> bool:
 def trigger_signal_m5(m5_df: pd.DataFrame, trend_dir: str) -> Optional[Signal]:
     """
     Main trigger engine on M5.
-    We merge 3 setup types, with priority:
-
-        1) PULLBACK      (best quality)
-        2) BREAKOUT      (fresh BB breakout)
-        3) BREAKOUT_CONT (momentum continuation along the band)
-
-    All of them respect the higher-TF trend_dir ("LONG" / "SHORT").
-    Returns a Signal or None.
+    Priority:
+        1) PULLBACK
+        2) BREAKOUT
+        3) BREAKOUT_CONT
     """
-    if m5_df is None or len(m5_df) < 50:
+    if m5_df is None or len(m5_df) < 60:
         return None
 
     high = m5_df["high"]
@@ -172,11 +168,14 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_dir: str) -> Optional[Signal]:
     close = m5_df["close"]
     open_ = m5_df["open"]
 
-    # Indicators
-    bb_upper, bb_mid, bb_lower = bollinger_bands(close, period=20, std_dev=2)
+    # Indicators (MATCH indicators.py signatures!)
+    bb_upper, bb_mid, bb_lower = bollinger_bands(close, period=20, std_factor=2.0)
     rsi_series = rsi(close, period=14)
-    stoch_k, stoch_d = stochastic(high, low, close, k_period=5, d_period=3)
+    stoch_k, stoch_d = stochastic_oscillator(high, low, close, k_period=14, d_period=3)
     adx_series, plus_di, minus_di = adx(high, low, close, period=14)
+
+    bull_engulf = bullish_engulfing(open_, close)
+    bear_engulf = bearish_engulfing(open_, close)
 
     # last & previous values
     c = float(close.iloc[-1])
@@ -186,20 +185,19 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_dir: str) -> Optional[Signal]:
     bb_u = float(bb_upper.iloc[-1])
     bb_m = float(bb_mid.iloc[-1])
     bb_l = float(bb_lower.iloc[-1])
+
     bb_u_prev = float(bb_upper.iloc[-2])
     bb_l_prev = float(bb_lower.iloc[-2])
 
     r = float(rsi_series.iloc[-1])
-    r_prev = float(rsi_series.iloc[-2])
-
     k = float(stoch_k.iloc[-1])
     d = float(stoch_d.iloc[-1])
     k_prev = float(stoch_k.iloc[-2])
     d_prev = float(stoch_d.iloc[-2])
 
-    adx_m5 = float(adx_series.iloc[-1])
-    plus_di_m5 = float(plus_di.iloc[-1])
-    minus_di_m5 = float(minus_di.iloc[-1])
+    adx_m5 = float(adx_series.iloc[-1]) if pd.notna(adx_series.iloc[-1]) else 0.0
+    plus_di_m5 = float(plus_di.iloc[-1]) if pd.notna(plus_di.iloc[-1]) else 0.0
+    minus_di_m5 = float(minus_di.iloc[-1]) if pd.notna(minus_di.iloc[-1]) else 0.0
 
     bar_time = m5_df["datetime"].iloc[-1]
     if isinstance(bar_time, pd.Timestamp):
@@ -218,171 +216,106 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_dir: str) -> Optional[Signal]:
     }
 
     # ------------------------------------------------------------------
-    # 1) PULLBACK setups (highest quality, first priority)
+    # 1) PULLBACK setups
     # ------------------------------------------------------------------
     def _pullback_long() -> Optional[Signal]:
-        # Price pulls back toward mid/lower band in an uptrend,
-        # momentum recovers (stoch cross up), RSI not too weak.
-        near_mid_or_lower = (c <= bb_m * 1.003) and (c >= bb_l * 0.997)
+        # pullback to mid/lower + stoch cross up + candle confirmation
+        near_mid_or_lower = (c <= bb_m * 1.004) and (c >= bb_l * 0.996)
         stoch_cross_up = (k > d) and (k_prev <= d_prev)
-        bullish_candle = c > o
-        rsi_ok = 40 <= r <= 60
+        candle_ok = (c > o) or bool(bull_engulf.iloc[-1])
+        rsi_ok = 38 <= r <= 60
 
-        if near_mid_or_lower and stoch_cross_up and bullish_candle and rsi_ok:
+        if near_mid_or_lower and stoch_cross_up and candle_ok and rsi_ok:
             extra = dict(extra_common)
             extra["setup_type"] = "PULLBACK_LONG"
-            reason = (
-                "Pullback LONG: price near BB mid/lower in uptrend, "
-                "stoch turning up, bullish candle."
-            )
-            return Signal(
-                direction="LONG",
-                price=c,
-                time=bar_time,
-                reason=reason,
-                extra=extra,
-            )
+            reason = "Pullback LONG: BB mid/lower + stoch cross up + candle confirm."
+            return Signal("LONG", c, bar_time, reason, extra)
         return None
 
     def _pullback_short() -> Optional[Signal]:
-        near_mid_or_upper = (c >= bb_m * 0.997) and (c <= bb_u * 1.003)
+        near_mid_or_upper = (c >= bb_m * 0.996) and (c <= bb_u * 1.004)
         stoch_cross_down = (k < d) and (k_prev >= d_prev)
-        bearish_candle = c < o
-        rsi_ok = 40 <= r <= 60
+        candle_ok = (c < o) or bool(bear_engulf.iloc[-1])
+        rsi_ok = 40 <= r <= 62
 
-        if near_mid_or_upper and stoch_cross_down and bearish_candle and rsi_ok:
+        if near_mid_or_upper and stoch_cross_down and candle_ok and rsi_ok:
             extra = dict(extra_common)
             extra["setup_type"] = "PULLBACK_SHORT"
-            reason = (
-                "Pullback SHORT: price near BB mid/upper in downtrend, "
-                "stoch turning down, bearish candle."
-            )
-            return Signal(
-                direction="SHORT",
-                price=c,
-                time=bar_time,
-                reason=reason,
-                extra=extra,
-            )
+            reason = "Pullback SHORT: BB mid/upper + stoch cross down + candle confirm."
+            return Signal("SHORT", c, bar_time, reason, extra)
         return None
 
     # ------------------------------------------------------------------
-    # 2) FRESH BREAKOUT setups (second priority)
+    # 2) FRESH BREAKOUT setups
     # ------------------------------------------------------------------
     def _breakout_long() -> Optional[Signal]:
-        prev_inside_band = c_prev <= bb_u_prev * 0.999
-        now_above_band = c > bb_u * 1.001
-        rsi_ok = 55 <= r <= 75
-        momentum_ok = k > 50
+        prev_inside = c_prev <= bb_u_prev * 0.999
+        now_break = c > bb_u * 1.001
+        rsi_ok = r >= 52
+        stoch_ok = k >= 55
 
-        if prev_inside_band and now_above_band and rsi_ok and momentum_ok:
+        if prev_inside and now_break and rsi_ok and stoch_ok:
             extra = dict(extra_common)
             extra["setup_type"] = "BREAKOUT_LONG"
-            reason = (
-                "Fresh breakout LONG: close breaks above upper BB from inside, "
-                "RSI and Stoch confirm momentum."
-            )
-            return Signal(
-                direction="LONG",
-                price=c,
-                time=bar_time,
-                reason=reason,
-                extra=extra,
-            )
+            reason = "Breakout LONG: close breaks above upper BB with momentum."
+            return Signal("LONG", c, bar_time, reason, extra)
         return None
 
     def _breakout_short() -> Optional[Signal]:
-        prev_inside_band = c_prev >= bb_l_prev * 1.001
-        now_below_band = c < bb_l * 0.999
-        rsi_ok = 25 <= r <= 45
-        momentum_ok = k < 50
+        prev_inside = c_prev >= bb_l_prev * 1.001
+        now_break = c < bb_l * 0.999
+        rsi_ok = r <= 48
+        stoch_ok = k <= 45
 
-        if prev_inside_band and now_below_band and rsi_ok and momentum_ok:
+        if prev_inside and now_break and rsi_ok and stoch_ok:
             extra = dict(extra_common)
             extra["setup_type"] = "BREAKOUT_SHORT"
-            reason = (
-                "Fresh breakout SHORT: close breaks below lower BB from inside, "
-                "RSI and Stoch confirm momentum."
-            )
-            return Signal(
-                direction="SHORT",
-                price=c,
-                time=bar_time,
-                reason=reason,
-                extra=extra,
-            )
+            reason = "Breakout SHORT: close breaks below lower BB with momentum."
+            return Signal("SHORT", c, bar_time, reason, extra)
         return None
 
     # ------------------------------------------------------------------
-    # 3) BREAKOUT CONTINUATION setups (third priority, more aggressive)
+    # 3) BREAKOUT CONTINUATION setups
     # ------------------------------------------------------------------
     def _breakout_cont_long() -> Optional[Signal]:
-        # Price riding upper band with strong ADX – aggressive continuation.
-        riding_upper = c > bb_u * 0.999
-        adx_strong = adx_m5 >= 25 and plus_di_m5 > minus_di_m5
-
-        if riding_upper and adx_strong:
+        riding_upper = c >= bb_u * 0.999
+        adx_ok = adx_m5 >= 20 and plus_di_m5 > minus_di_m5
+        if riding_upper and adx_ok:
             extra = dict(extra_common)
             extra["setup_type"] = "BREAKOUT_CONT_LONG"
-            reason = (
-                "Momentum breakout continuation LONG: price riding upper BB "
-                "with strong ADX."
-            )
-            return Signal(
-                direction="LONG",
-                price=c,
-                time=bar_time,
-                reason=reason,
-                extra=extra,
-            )
+            reason = "Breakout continuation LONG: riding upper BB with ADX support."
+            return Signal("LONG", c, bar_time, reason, extra)
         return None
 
     def _breakout_cont_short() -> Optional[Signal]:
-        riding_lower = c < bb_l * 1.001
-        adx_strong = adx_m5 >= 25 and minus_di_m5 > plus_di_m5
-
-        if riding_lower and adx_strong:
+        riding_lower = c <= bb_l * 1.001
+        adx_ok = adx_m5 >= 20 and minus_di_m5 > plus_di_m5
+        if riding_lower and adx_ok:
             extra = dict(extra_common)
             extra["setup_type"] = "BREAKOUT_CONT_SHORT"
-            reason = (
-                "Momentum breakout continuation SHORT: price riding lower BB "
-                "with strong ADX."
-            )
-            return Signal(
-                direction="SHORT",
-                price=c,
-                time=bar_time,
-                reason=reason,
-                extra=extra,
-            )
+            reason = "Breakout continuation SHORT: riding lower BB with ADX support."
+            return Signal("SHORT", c, bar_time, reason, extra)
         return None
 
     # ------------------------------------------------------------------
-    # Priority by setup quality:
-    #   Pullback > Fresh Breakout > Breakout Continuation
+    # Priority order
     # ------------------------------------------------------------------
     if trend_dir == "LONG":
         sig = _pullback_long()
         if sig:
             return sig
-
         sig = _breakout_long()
         if sig:
             return sig
+        return _breakout_cont_long()
 
-        sig = _breakout_cont_long()
-        return sig
-
-    elif trend_dir == "SHORT":
+    if trend_dir == "SHORT":
         sig = _pullback_short()
         if sig:
             return sig
-
         sig = _breakout_short()
         if sig:
             return sig
-
-        sig = _breakout_cont_short()
-        return sig
+        return _breakout_cont_short()
 
     return None
