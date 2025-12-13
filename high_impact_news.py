@@ -1,6 +1,6 @@
 import datetime as dt
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -20,7 +20,7 @@ _CACHE: Dict[str, Any] = {
 }
 
 
-def _fetch_calendar_events() -> List[Dict[str, Any]]:
+def _fetch_calendar_events(cache_seconds: int = 300) -> List[Dict[str, Any]]:
     """
     Fetch calendar events from ForexFactory JSON and cache the result.
     Returns a list of event dicts.
@@ -29,8 +29,8 @@ def _fetch_calendar_events() -> List[Dict[str, Any]]:
 
     now = dt.datetime.utcnow()
     last_fetch = _CACHE.get("last_fetch")
-    if last_fetch and (now - last_fetch).total_seconds() < 300:
-        # Reuse cache if we fetched less than 5 minutes ago
+
+    if isinstance(last_fetch, dt.datetime) and (now - last_fetch).total_seconds() < cache_seconds:
         return _CACHE.get("events", [])
 
     try:
@@ -45,15 +45,15 @@ def _fetch_calendar_events() -> List[Dict[str, Any]]:
     if isinstance(data, list):
         events = data
     elif isinstance(data, dict):
-        if "events" in data:
+        if "events" in data and isinstance(data["events"], list):
             events = data["events"]
-        elif "calendar" in data:
+        elif "calendar" in data and isinstance(data["calendar"], list):
             events = data["calendar"]
         else:
             possible: List[Dict[str, Any]] = []
             for v in data.values():
                 if isinstance(v, list):
-                    possible.extend(v)
+                    possible.extend([x for x in v if isinstance(x, dict)])
             events = possible
     else:
         events = []
@@ -67,7 +67,7 @@ def _event_matches_xauusd(ev: Dict[str, Any]) -> bool:
     """
     Return True if an event is relevant for XAUUSD (USD / ALL currencies, High impact).
     """
-    currency = str(ev.get("currency", "") or ev.get("country", "") or "").upper()
+    currency = str(ev.get("currency", "") or ev.get("country", "") or "").upper().strip()
     if currency not in RELEVANT_CURRENCIES:
         return False
 
@@ -75,23 +75,51 @@ def _event_matches_xauusd(ev: Dict[str, Any]) -> bool:
     return "high" in impact
 
 
-def _event_time(ev: Dict[str, Any]) -> dt.datetime | None:
+def _parse_epoch(ts_int: int) -> Optional[dt.datetime]:
+    """
+    Handle epoch seconds vs epoch milliseconds.
+    """
+    try:
+        # milliseconds are usually 13 digits
+        if ts_int > 10_000_000_000:  # > ~2286-11-20 in seconds => likely ms
+            ts_int = ts_int // 1000
+        return dt.datetime.utcfromtimestamp(ts_int)
+    except Exception:
+        return None
+
+
+def _event_time(ev: Dict[str, Any]) -> Optional[dt.datetime]:
     """
     Extract event time as UTC datetime from different possible fields.
+    ForexFactory feed may contain:
+      - "timestamp" (seconds or milliseconds)
+      - "time" / "date" as epoch-like string OR ISO string
     """
     ts = ev.get("timestamp") or ev.get("time") or ev.get("date")
     if ts is None:
         return None
 
+    # Numeric epoch
+    if isinstance(ts, (int, float)):
+        return _parse_epoch(int(ts))
+
+    s = str(ts).strip()
+    if not s:
+        return None
+
+    # Epoch-like string
+    if s.isdigit():
+        return _parse_epoch(int(s))
+
+    # ISO-like string (try robust parsing)
     try:
-        if isinstance(ts, (int, float)):
-            return dt.datetime.utcfromtimestamp(int(ts))
-        return dt.datetime.utcfromtimestamp(int(str(ts)))
+        # If it's ISO without timezone, treat as UTC
+        t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            return t.replace(tzinfo=dt.timezone.utc).astimezone(dt.timezone.utc).replace(tzinfo=None)
+        return t.astimezone(dt.timezone.utc).replace(tzinfo=None)
     except Exception:
-        try:
-            return dt.datetime.fromisoformat(str(ts))
-        except Exception:
-            return None
+        return None
 
 
 def has_high_impact_news_near(symbol: str, now_utc: dt.datetime, window_minutes: int = 60) -> bool:
@@ -116,6 +144,10 @@ def has_high_impact_news_near(symbol: str, now_utc: dt.datetime, window_minutes:
     if not events:
         return False
 
+    # normalize now_utc
+    if now_utc.tzinfo is not None:
+        now_utc = now_utc.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
     now_ts = int(now_utc.timestamp())
     window = window_minutes * 60
 
@@ -124,12 +156,25 @@ def has_high_impact_news_near(symbol: str, now_utc: dt.datetime, window_minutes:
             continue
         if not _event_matches_xauusd(ev):
             continue
+
         t = _event_time(ev)
         if t is None:
             continue
+
         if abs(int(t.timestamp()) - now_ts) <= window:
             return True
 
     return False
 
 
+# --------------------------------------------------------------------
+# Compatibility wrapper: MAIN IMPORTS THIS NAME OFTEN
+# --------------------------------------------------------------------
+def has_high_impact_news_nearby(now_utc: dt.datetime, window_minutes: int = 60, symbol: str = "XAUUSD") -> bool:
+    """
+    Backwards-compatible wrapper so main.py can do:
+      from high_impact_news import has_high_impact_news_nearby
+
+    Internally uses has_high_impact_news_near(...).
+    """
+    return has_high_impact_news_near(symbol=symbol, now_utc=now_utc, window_minutes=window_minutes)
