@@ -4,21 +4,24 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from indicators import bollinger_bands, rsi, stochastic_oscillator, adx, bullish_engulfing, bearish_engulfing
+from indicators import (
+    bollinger_bands,
+    rsi,
+    stochastic_oscillator,
+    adx,
+    bullish_engulfing,
+    bearish_engulfing,
+)
 
 
 @dataclass
 class Signal:
-    direction: str          # "LONG" or "SHORT"
+    direction: str
     price: float
     time: dt.datetime
     reason: str
     extra: Dict[str, Any]
 
-
-# ---------------------------------------------------------------------------
-# Session helper
-# ---------------------------------------------------------------------------
 
 def is_within_sessions(
     now_utc: dt.datetime,
@@ -27,35 +30,19 @@ def is_within_sessions(
     session_2_start: Optional[int],
     session_2_end: Optional[int],
 ) -> bool:
-    """
-    now_utc:      datetime in UTC
-    session_*:    HHMM, e.g. 700 for 07:00, 2000 for 20:00
-    """
     hhmm = now_utc.hour * 100 + now_utc.minute
-
     in_s1 = session_1_start <= hhmm <= session_1_end
-
+    in_s2 = False
     if session_2_start is not None and session_2_end is not None:
         in_s2 = session_2_start <= hhmm <= session_2_end
-    else:
-        in_s2 = False
-
     return in_s1 or in_s2
 
-
-# ---------------------------------------------------------------------------
-# Trend detection on H1 / M15
-# ---------------------------------------------------------------------------
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
 def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
-    """
-    Detect higher-timeframe trend on H1 using EMA(20/50), RSI, and ADX.
-    Returns "LONG", "SHORT", or None (ranging / unclear).
-    """
     if h1_df is None or len(h1_df) < 60:
         return None
 
@@ -74,15 +61,11 @@ def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
     r = float(rsi_series.iloc[-1])
     a = float(adx_series.iloc[-1]) if pd.notna(adx_series.iloc[-1]) else 0.0
 
-    # basic filters (if ADX weak -> ranging)
     if a < 15:
         return None
 
-    # Uptrend
     if c > e20 > e50 and r > 55:
         return "LONG"
-
-    # Downtrend
     if c < e20 < e50 and r < 45:
         return "SHORT"
 
@@ -90,10 +73,6 @@ def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
 
 
 def detect_trend_m15_direction(m15_df: pd.DataFrame) -> Optional[str]:
-    """
-    Fallback trend detection on M15 when H1 is ranging.
-    Slightly looser thresholds than H1.
-    """
     if m15_df is None or len(m15_df) < 60:
         return None
 
@@ -124,11 +103,6 @@ def detect_trend_m15_direction(m15_df: pd.DataFrame) -> Optional[str]:
 
 
 def confirm_trend_m15(m15_df: pd.DataFrame, trend: str) -> bool:
-    """
-    Confirm H1 trend using M15 structure.
-    - For LONG: EMA20 > EMA50 and price above EMA20
-    - For SHORT: EMA20 < EMA50 and price below EMA20
-    """
     if m15_df is None or len(m15_df) < 40:
         return False
 
@@ -148,18 +122,7 @@ def confirm_trend_m15(m15_df: pd.DataFrame, trend: str) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# M5 trigger logic: Pullback + Breakout + Breakout Continuation
-# ---------------------------------------------------------------------------
-
 def trigger_signal_m5(m5_df: pd.DataFrame, trend_dir: str) -> Optional[Signal]:
-    """
-    Main trigger engine on M5.
-    Priority:
-        1) PULLBACK
-        2) BREAKOUT
-        3) BREAKOUT_CONT
-    """
     if m5_df is None or len(m5_df) < 60:
         return None
 
@@ -168,7 +131,6 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_dir: str) -> Optional[Signal]:
     close = m5_df["close"]
     open_ = m5_df["open"]
 
-    # Indicators (MATCH indicators.py signatures!)
     bb_upper, bb_mid, bb_lower = bollinger_bands(close, period=20, std_factor=2.0)
     rsi_series = rsi(close, period=14)
     stoch_k, stoch_d = stochastic_oscillator(high, low, close, k_period=14, d_period=3)
@@ -177,7 +139,6 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_dir: str) -> Optional[Signal]:
     bull_engulf = bullish_engulfing(open_, close)
     bear_engulf = bearish_engulfing(open_, close)
 
-    # last & previous values
     c = float(close.iloc[-1])
     o = float(open_.iloc[-1])
     c_prev = float(close.iloc[-2])
@@ -215,11 +176,8 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_dir: str) -> Optional[Signal]:
         "minus_di_m5": minus_di_m5,
     }
 
-    # ------------------------------------------------------------------
-    # 1) PULLBACK setups
-    # ------------------------------------------------------------------
+    # --- Pullbacks ---
     def _pullback_long() -> Optional[Signal]:
-        # pullback to mid/lower + stoch cross up + candle confirmation
         near_mid_or_lower = (c <= bb_m * 1.004) and (c >= bb_l * 0.996)
         stoch_cross_up = (k > d) and (k_prev <= d_prev)
         candle_ok = (c > o) or bool(bull_engulf.iloc[-1])
@@ -245,9 +203,7 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_dir: str) -> Optional[Signal]:
             return Signal("SHORT", c, bar_time, reason, extra)
         return None
 
-    # ------------------------------------------------------------------
-    # 2) FRESH BREAKOUT setups
-    # ------------------------------------------------------------------
+    # --- Fresh Breakouts ---
     def _breakout_long() -> Optional[Signal]:
         prev_inside = c_prev <= bb_u_prev * 0.999
         now_break = c > bb_u * 1.001
@@ -274,9 +230,7 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_dir: str) -> Optional[Signal]:
             return Signal("SHORT", c, bar_time, reason, extra)
         return None
 
-    # ------------------------------------------------------------------
-    # 3) BREAKOUT CONTINUATION setups
-    # ------------------------------------------------------------------
+    # --- Continuations ---
     def _breakout_cont_long() -> Optional[Signal]:
         riding_upper = c >= bb_u * 0.999
         adx_ok = adx_m5 >= 20 and plus_di_m5 > minus_di_m5
@@ -297,25 +251,10 @@ def trigger_signal_m5(m5_df: pd.DataFrame, trend_dir: str) -> Optional[Signal]:
             return Signal("SHORT", c, bar_time, reason, extra)
         return None
 
-    # ------------------------------------------------------------------
-    # Priority order
-    # ------------------------------------------------------------------
+    # Priority: Pullback > Breakout > Continuation
     if trend_dir == "LONG":
-        sig = _pullback_long()
-        if sig:
-            return sig
-        sig = _breakout_long()
-        if sig:
-            return sig
-        return _breakout_cont_long()
-
+        return _pullback_long() or _breakout_long() or _breakout_cont_long()
     if trend_dir == "SHORT":
-        sig = _pullback_short()
-        if sig:
-            return sig
-        sig = _breakout_short()
-        if sig:
-            return sig
-        return _breakout_cont_short()
+        return _pullback_short() or _breakout_short() or _breakout_cont_short()
 
     return None
