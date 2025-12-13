@@ -1,3 +1,4 @@
+# main.py
 import time
 import logging
 import datetime as dt
@@ -18,6 +19,18 @@ from strategy import (
     trigger_signal_m5,
 )
 
+from high_impact_news import has_high_impact_news_near
+
+from trade_manager import (
+    ActiveTrade,
+    TradeJournal,
+    new_trade_id,
+    should_invalidate,
+    check_tp_sl_hit,
+    compute_r_result,
+)
+
+
 # -------------------------
 # Logging
 # -------------------------
@@ -27,43 +40,39 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-# -------------------------
-# Optional news module (safe import)
-# -------------------------
-def _safe_has_high_impact_news(now_utc: dt.datetime) -> bool:
-    """
-    Safe wrapper: if module/function missing or broken, we continue without news filter.
-    """
-    try:
-        import high_impact_news  # noqa
-        fn = None
-        if hasattr(high_impact_news, "has_high_impact_news_nearby"):
-            fn = getattr(high_impact_news, "has_high_impact_news_nearby")
-        elif hasattr(high_impact_news, "has_high_impact_news_near"):
-            fn = getattr(high_impact_news, "has_high_impact_news_near")
 
-        if fn is None:
-            return False
+# -------------------------
+# Market open (fix weekend signals)
+# -------------------------
+def is_market_open(now_utc: dt.datetime) -> bool:
+    """
+    FX-style market hours:
+      - Closed Sat
+      - Closed Sun until 22:00 UTC
+      - Closed Fri from 22:00 UTC
+    """
+    wd = now_utc.weekday()  # Mon=0 ... Sun=6
+    hhmm = now_utc.hour * 100 + now_utc.minute
 
-        return bool(fn(now_utc))
-    except Exception:
+    if wd == 5:  # Saturday
         return False
+    if wd == 6:  # Sunday
+        return hhmm >= 2200
+    if wd == 4:  # Friday
+        return hhmm < 2200
+    return True
 
 
 # -------------------------
 # Resampling (M5 -> M15/H1)
 # -------------------------
 def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """
-    rule: "15min" or "1h"
-    Expects df with a datetime column (UTC) or datetime index.
-    """
     tmp = df.copy()
     if "datetime" in tmp.columns:
-        tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True, errors="coerce")
-        tmp = tmp.dropna(subset=["datetime"]).set_index("datetime")
+        tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True)
+        tmp = tmp.set_index("datetime")
     else:
-        tmp.index = pd.to_datetime(tmp.index, utc=True, errors="coerce")
+        tmp.index = pd.to_datetime(tmp.index, utc=True)
 
     agg = tmp.resample(rule).agg(
         open=("open", "first"),
@@ -120,9 +129,6 @@ def risk_tag_from_adx_m5(adx_m5: float) -> str:
 
 
 def market_regime(h1_df: pd.DataFrame) -> str:
-    """
-    Simple regime using Bollinger width + ATR magnitude (H1).
-    """
     if h1_df is None or len(h1_df) < 60:
         return "Unknown"
 
@@ -132,7 +138,6 @@ def market_regime(h1_df: pd.DataFrame) -> str:
 
     upper, mid, lower = indicators.bollinger_bands(close, period=20, std_factor=2.0)
     bw = (upper - lower) / mid.replace(0, pd.NA)
-
     a = indicators.atr(high, low, close, period=14)
 
     bw_last = float(bw.iloc[-1]) if pd.notna(bw.iloc[-1]) else 0.0
@@ -149,9 +154,6 @@ def market_regime(h1_df: pd.DataFrame) -> str:
 # Dynamic TP/SL (ATR-based)
 # -------------------------
 def tp_sl_multipliers(setup_type: str) -> Tuple[float, float, float]:
-    """
-    (sl_mult, tp1_mult, tp2_mult) on ATR(H1,14)
-    """
     if setup_type.startswith("PULLBACK"):
         return (0.90, 1.60, 2.60)
     if setup_type.startswith("BREAKOUT_CONT"):
@@ -165,11 +167,7 @@ def apply_dynamic_tp_sl(signal, h1_df: pd.DataFrame) -> None:
     if h1_df is None or len(h1_df) < 60:
         return
 
-    high = h1_df["high"]
-    low = h1_df["low"]
-    close = h1_df["close"]
-
-    atr_series = indicators.atr(high, low, close, period=14)
+    atr_series = indicators.atr(h1_df["high"], h1_df["low"], h1_df["close"], period=14)
     atr_h1 = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else None
     if atr_h1 is None or atr_h1 <= 0:
         return
@@ -195,82 +193,21 @@ def apply_dynamic_tp_sl(signal, h1_df: pd.DataFrame) -> None:
 
 
 # -------------------------
-# Trend Exhaustion + M15 Veto Filters
+# Adaptive Confidence Score
 # -------------------------
-def h1_exhaustion_veto(h1_df: pd.DataFrame, trend_dir: str, setup_type: str) -> Tuple[bool, str]:
-    """
-    Blocks 'late trend' pullbacks that are prone to sharp reversal.
-    """
-    if h1_df is None or len(h1_df) < 60:
-        return False, ""
-
-    close = h1_df["close"]
-    rsi_h1 = indicators.rsi(close, period=14)
-    bb_u, bb_m, bb_l = indicators.bollinger_bands(close, period=20, std_factor=2.0)
-
-    c = float(close.iloc[-1])
-    r = float(rsi_h1.iloc[-1]) if pd.notna(rsi_h1.iloc[-1]) else 50.0
-    u = float(bb_u.iloc[-1])
-    l = float(bb_l.iloc[-1])
-
-    # We mainly block PULLBACK entries when trend is stretched
-    if setup_type.startswith("PULLBACK"):
-        if trend_dir == "LONG":
-            stretched = (r >= 70) or (c >= u * 0.995)
-            if stretched:
-                return True, "H1 exhaustion veto: LONG stretched (RSI>=70 or near/above upper BB)."
-        if trend_dir == "SHORT":
-            stretched = (r <= 30) or (c <= l * 1.005)
-            if stretched:
-                return True, "H1 exhaustion veto: SHORT stretched (RSI<=30 or near/below lower BB)."
-
-    return False, ""
-
-
-def m15_veto(m15_df: pd.DataFrame, trend_dir: str, setup_type: str) -> Tuple[bool, str]:
-    """
-    Stops M5 setups when M15 structure is not supporting the direction.
-    Strongest veto for Pullbacks + Continuations (most sensitive to micro flips).
-    """
-    if m15_df is None or len(m15_df) < 60:
-        return False, ""
-
-    close = m15_df["close"]
-    ema20 = close.ewm(span=20, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
-    rsi15 = indicators.rsi(close, period=14)
-
-    c = float(close.iloc[-1])
-    e20 = float(ema20.iloc[-1])
-    e50 = float(ema50.iloc[-1])
-    r = float(rsi15.iloc[-1]) if pd.notna(rsi15.iloc[-1]) else 50.0
-
-    if trend_dir == "LONG":
-        ok = (e20 > e50) and (c >= e20) and (r >= 50)
-        if not ok and (setup_type.startswith("PULLBACK") or setup_type.startswith("BREAKOUT_CONT")):
-            return True, "M15 veto: LONG not supported (EMA/RSI structure weak)."
-
-    if trend_dir == "SHORT":
-        ok = (e20 < e50) and (c <= e20) and (r <= 50)
-        if not ok and (setup_type.startswith("PULLBACK") or setup_type.startswith("BREAKOUT_CONT")):
-            return True, "M15 veto: SHORT not supported (EMA/RSI structure weak)."
-
-    return False, ""
-
-
-# -------------------------
-# Confidence Score Engine (Upgraded)
-# -------------------------
-def compute_confidence(
+def compute_confidence_adaptive(
     trend_source: str,
     setup_type: str,
     adx_h1: float,
     adx_m5: float,
     high_news: bool,
-    market_regime_text: str,
-    m15_confirmed: bool,
-    h1_exhausted: bool,
+    m5_rsi: float,
+    plus_di_m5: float,
+    minus_di_m5: float,
 ) -> int:
+    """
+    Adaptive: adds penalties for fragile contexts and DI disagreement.
+    """
     score = 50
 
     # Trend source reliability
@@ -279,41 +216,38 @@ def compute_confidence(
     # Setup quality
     if setup_type.startswith("PULLBACK"):
         score += 15
-    elif setup_type.startswith("BREAKOUT"):
+    elif setup_type.startswith("BREAKOUT") and not setup_type.startswith("BREAKOUT_CONT"):
         score += 8
     elif setup_type.startswith("BREAKOUT_CONT"):
         score += 3
 
-    # Trend strength ADX(H1)
+    # H1 trend strength
     if adx_h1 >= 30:
         score += 12
     elif adx_h1 >= 20:
         score += 7
-    else:
-        score -= 6
+    elif adx_h1 < 18:
+        score -= 10
 
-    # Micro ADX (M5)
+    # M5 structure
     if adx_m5 >= 25:
         score += 6
     elif adx_m5 < 15:
         score -= 5
 
-    # M15 confirmation bonus
-    score += 6 if m15_confirmed else -5
+    # DI disagreement penalty
+    # (if ADX high but DI suggests opposite pressure, confidence should drop)
+    if adx_m5 >= 30:
+        if plus_di_m5 < minus_di_m5 and "LONG" in setup_type:
+            score -= 10
+        if minus_di_m5 < plus_di_m5 and "SHORT" in setup_type:
+            score -= 10
 
-    # Regime adjustments
-    if market_regime_text == "Low Volatility / Compression":
-        # Breakouts are more meaningful during compression
-        if setup_type.startswith("BREAKOUT"):
-            score += 6
-    if market_regime_text == "High Volatility":
-        # Pullbacks are more dangerous in high vol (whipsaws)
-        if setup_type.startswith("PULLBACK"):
-            score -= 5
-
-    # Exhaustion penalty
-    if h1_exhausted:
-        score -= 12
+    # RSI context penalty
+    if setup_type.endswith("_LONG") and m5_rsi < 50:
+        score -= 6
+    if setup_type.endswith("_SHORT") and m5_rsi > 50:
+        score -= 6
 
     # News penalty
     if high_news:
@@ -323,23 +257,7 @@ def compute_confidence(
 
 
 # -------------------------
-# Cooldown Protocol
-# -------------------------
-def cooldown_seconds_for_setup(setup_type: str) -> int:
-    """
-    Time-based cooldown to avoid rapid re-entries.
-    """
-    if setup_type.startswith("PULLBACK"):
-        return 12 * 60  # 12 min
-    if setup_type.startswith("BREAKOUT"):
-        return 9 * 60   # 9 min
-    if setup_type.startswith("BREAKOUT_CONT"):
-        return 6 * 60   # 6 min
-    return 10 * 60
-
-
-# -------------------------
-# Telegram message (PLAIN TEXT) — EXACT TEMPLATE YOU GAVE
+# Telegram message template (exact format you requested)
 # -------------------------
 def build_signal_message(
     symbol_label: str,
@@ -380,32 +298,23 @@ def build_signal_message(
             risk = float(sl) - entry
             rr1 = (entry - float(tp1)) / risk if risk > 0 else 0.0
             rr2 = (entry - float(tp2)) / risk if risk > 0 else 0.0
-
-        if risk > 0:
-            rr_line = f"RR to TP1: {rr1:.2f}R | RR to TP2: {rr2:.2f}R"
+        rr_line = f"RR to TP1: {rr1:.2f}R | RR to TP2: {rr2:.2f}R"
 
     lines = []
     lines.append(f"XAUUSD Signal [{risk_tag}]")
     lines.append(f"{arrow} {symbol_label} at {entry:.2f}")
     lines.append("")
-
-    # SL/TP block (as per your template)
-    if sl is not None:
+    if sl is not None and tp1 is not None and tp2 is not None:
         lines.append(f"SL: {float(sl):.2f}")
-    if tp1 is not None:
         lines.append(f"TP1: {float(tp1):.2f}")
-    if tp2 is not None:
         lines.append(f"TP2: {float(tp2):.2f}")
-
     lines.append("")
     lines.append(f"Setup: {setup_text} ({setup_type})")
     lines.append(f"Confidence: {confidence_score} ({confidence_text})")
     lines.append("")
-
     if rr_line:
         lines.append(rr_line)
-        lines.append("")
-
+    lines.append("")
     lines.append(f"Time (UTC): {signal.time.isoformat()}")
     lines.append(f"Trend Bias: {trend_label} (source: {trend_source})")
     lines.append(f"Session: {session_window}")
@@ -419,54 +328,62 @@ def build_signal_message(
     lines.append("")
     lines.append("No high-impact news flag near this time." if not high_news else "HIGH-IMPACT NEWS NEARBY: expect extra volatility.")
     lines.append(f"RSI(M5): {float(signal.extra.get('m5_rsi', 0.0)):.2f} | StochK(M5): {float(signal.extra.get('m5_stoch_k', 0.0)):.2f}")
-    lines.append(
-        f"ADX(M5): {float(signal.extra.get('adx_m5', 0.0)):.2f} "
-        f"(+DI: {float(signal.extra.get('plus_di_m5', 0.0)):.2f}, -DI: {float(signal.extra.get('minus_di_m5', 0.0)):.2f})"
-    )
-    lines.append(
-        "BB(M5): upper {0:.2f}, mid {1:.2f}, lower {2:.2f}".format(
-            float(signal.extra.get("bb_upper", 0.0)),
-            float(signal.extra.get("bb_mid", 0.0)),
-            float(signal.extra.get("bb_lower", 0.0)),
-        )
-    )
+    lines.append(f"ADX(M5): {float(signal.extra.get('adx_m5', 0.0)):.2f} (+DI: {float(signal.extra.get('plus_di_m5', 0.0)):.2f}, -DI: {float(signal.extra.get('minus_di_m5', 0.0)):.2f})")
+    lines.append("BB(M5): upper {0:.2f}, mid {1:.2f}, lower {2:.2f}".format(
+        float(signal.extra.get("bb_upper", 0.0)),
+        float(signal.extra.get("bb_mid", 0.0)),
+        float(signal.extra.get("bb_lower", 0.0)),
+    ))
 
     return "\n".join(lines)
 
 
 # -------------------------
-# Main loop (NEW candle detection + cooldown)
+# Cooldown protocol
+# -------------------------
+def in_cooldown(now_utc: dt.datetime, last_signal_time: Optional[dt.datetime], minutes: int = 20) -> bool:
+    if last_signal_time is None:
+        return False
+    return (now_utc - last_signal_time).total_seconds() < (minutes * 60)
+
+
+# -------------------------
+# Main loop
 # -------------------------
 def main():
     settings = load_settings()
 
-    symbol_td = settings.xau_symbol_td  # "XAU/USD"
+    symbol_td = settings.xau_symbol_td
     symbol_label = "XAUUSD"
 
-    s1_start = settings.session_1_start  # 700
-    s1_end = settings.session_1_end      # 2000
+    s1_start = settings.session_1_start
+    s1_end = settings.session_1_end
 
-    # Polling + API calls:
-    sleep_seconds = 30                 # check more frequently
-    fetch_interval_seconds = 120       # fetch every 2 minutes (as you asked)
+    sleep_seconds = 60
+    fetch_interval_seconds = 180  # keep API calls sane
 
     telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id)
+    journal = TradeJournal("trades.csv")
 
-    logger.info("Starting XAUUSD bot (H1 primary, M15 fallback) + NEW M5 candle detection + cooldown.")
+    logger.info("Starting XAUUSD bot (H1 primary, M15 fallback) + NEW M5 candle detection + journaling + invalidation.")
 
     last_fetch_ts: float = 0.0
     cached_m5: Optional[pd.DataFrame] = None
 
-    # New candle detection state
-    last_seen_m5_candle_time: Optional[pd.Timestamp] = None
-
-    # Cooldown state
-    last_signal_sent_ts: Optional[float] = None
-    last_signal_key: Optional[str] = None
+    last_closed_candle_time: Optional[pd.Timestamp] = None
+    last_signal_time: Optional[dt.datetime] = None
+    active_trade: Optional[ActiveTrade] = None
 
     while True:
         now_utc = dt.datetime.now(dt.timezone.utc)
 
+        # Market open filter (fix weekend signals)
+        if not is_market_open(now_utc):
+            logger.info("Market closed (weekend window). Sleeping %ss...", sleep_seconds)
+            time.sleep(sleep_seconds)
+            continue
+
+        # Session window
         if not is_within_sessions(
             now_utc=now_utc,
             session_1_start=s1_start,
@@ -478,14 +395,11 @@ def main():
             time.sleep(sleep_seconds)
             continue
 
-        # Fetch/cached M5
+        # Fetch / cache
         need_fetch = (time.time() - last_fetch_ts) >= fetch_interval_seconds or cached_m5 is None
         if need_fetch:
             logger.info("Fetching fresh M5 OHLCV data from Twelve Data...")
-            cached_m5 = fetch_m5_ohlcv_twelvedata(
-                symbol=symbol_td,
-                api_key=settings.twelvedata_api_key,
-            )
+            cached_m5 = fetch_m5_ohlcv_twelvedata(symbol=symbol_td, api_key=settings.twelvedata_api_key)
             last_fetch_ts = time.time()
         else:
             logger.info("Using cached M5 OHLCV data.")
@@ -495,32 +409,98 @@ def main():
             time.sleep(sleep_seconds)
             continue
 
-        # New candle detection: only evaluate on new M5 close
-        current_candle_time = pd.to_datetime(cached_m5["datetime"].iloc[-1], utc=True, errors="coerce")
-        if pd.isna(current_candle_time):
-            logger.info("Bad candle timestamp received; sleeping.")
+        cached_m5["datetime"] = pd.to_datetime(cached_m5["datetime"], utc=True)
+        current_last_time = cached_m5["datetime"].iloc[-1]
+
+        # Only evaluate on NEW closed candle
+        if last_closed_candle_time is not None and current_last_time <= last_closed_candle_time:
+            logger.info("No new M5 candle closed yet (last=%s, current=%s). Sleeping %ss...",
+                        last_closed_candle_time, current_last_time, sleep_seconds)
             time.sleep(sleep_seconds)
             continue
 
-        if last_seen_m5_candle_time is not None and current_candle_time <= last_seen_m5_candle_time:
-            logger.info(
-                "No new M5 candle closed yet (last=%s, current=%s). Sleeping %ss...",
-                last_seen_m5_candle_time,
-                current_candle_time,
-                sleep_seconds,
-            )
-            time.sleep(sleep_seconds)
-            continue
+        last_closed_candle_time = current_last_time
+        logger.info("New M5 candle detected: %s — evaluating...", current_last_time)
 
-        last_seen_m5_candle_time = current_candle_time
-        logger.info("New M5 candle detected: %s — evaluating signal...", current_candle_time)
-
-        # Resample
+        # Build higher TF
         m15_df = resample_ohlc(cached_m5, "15min")
         h1_df = resample_ohlc(cached_m5, "1h")
-
         if h1_df is None or len(h1_df) < 60 or m15_df is None or len(m15_df) < 60:
             logger.info("Not enough data after resampling, sleeping %ss...", sleep_seconds)
+            time.sleep(sleep_seconds)
+            continue
+
+        # Update active trade outcomes (journaling)
+        last_candle = cached_m5.iloc[-1]
+
+        if active_trade is not None and active_trade.status == "OPEN":
+            hit = check_tp_sl_hit(active_trade, last_candle)
+            if hit:
+                active_trade.status = hit["status"]
+                active_trade.exit_time = last_closed_candle_time.to_pydatetime()
+                active_trade.exit_price = float(hit["exit_price"])
+                active_trade.result_r = compute_r_result(active_trade.direction, active_trade.entry, active_trade.sl, active_trade.exit_price)
+                journal.update_trade(active_trade)
+
+                telegram.send_message(
+                    f"Trade Update [{active_trade.status}]\n"
+                    f"{active_trade.direction} {symbol_label}\n"
+                    f"Exit: {active_trade.exit_price:.2f}\n"
+                    f"R: {active_trade.result_r:.2f}\n"
+                    f"TradeID: {active_trade.trade_id}"
+                )
+                logger.info("Trade closed: %s status=%s R=%.2f", active_trade.trade_id, active_trade.status, active_trade.result_r)
+
+                # Cooldown starts after closure too
+                last_signal_time = active_trade.exit_time
+                active_trade = None
+
+        # Invalidation (only if still open)
+        if active_trade is not None and active_trade.status == "OPEN":
+            # compute BB + RSI quickly for invalidation rules
+            close = cached_m5["close"]
+            bb_u, bb_m, bb_l = indicators.bollinger_bands(close, period=20, std_factor=2.0)
+            rsi_m5 = float(indicators.rsi(close, period=14).iloc[-1]) if len(close) >= 20 else 50.0
+
+            reason = should_invalidate(
+                trade=active_trade,
+                last_closed_m5=last_candle,
+                bb_mid=float(bb_m.iloc[-1]),
+                bb_upper=float(bb_u.iloc[-1]),
+                bb_lower=float(bb_l.iloc[-1]),
+                rsi_m5=rsi_m5,
+            )
+
+            # Only allow invalidation within deadline
+            if active_trade.invalidation_deadline and now_utc <= active_trade.invalidation_deadline and reason:
+                active_trade.status = "INVALIDATED"
+                active_trade.invalidated_reason = reason
+                active_trade.exit_time = last_closed_candle_time.to_pydatetime()
+                active_trade.exit_price = float(last_candle["close"])
+                active_trade.result_r = compute_r_result(active_trade.direction, active_trade.entry, active_trade.sl, active_trade.exit_price)
+                journal.update_trade(active_trade)
+
+                telegram.send_message(
+                    f"Signal Invalidated ❌\n"
+                    f"TradeID: {active_trade.trade_id}\n"
+                    f"Reason: {reason}\n"
+                    f"Close: {active_trade.exit_price:.2f}\n"
+                    f"R (if entered): {active_trade.result_r:.2f}"
+                )
+                logger.info("Trade invalidated: %s reason=%s", active_trade.trade_id, reason)
+
+                last_signal_time = active_trade.exit_time
+                active_trade = None
+
+        # If a trade is still open, we do NOT open new signals (keeps system clean)
+        if active_trade is not None:
+            logger.info("Active trade open, skipping new entries.")
+            time.sleep(sleep_seconds)
+            continue
+
+        # Cooldown protocol
+        if in_cooldown(now_utc, last_signal_time, minutes=20):
+            logger.info("Cooldown active, skipping.")
             time.sleep(sleep_seconds)
             continue
 
@@ -528,10 +508,9 @@ def main():
         adx_h1_series, _, _ = indicators.adx(h1_df["high"], h1_df["low"], h1_df["close"], period=14)
         adx_h1 = float(adx_h1_series.iloc[-1]) if pd.notna(adx_h1_series.iloc[-1]) else 0.0
 
-        # Trend detection
+        # Trend
         h1_trend = detect_trend_h1(h1_df)
         trend_source = "H1"
-
         if h1_trend is None:
             m15_dir = detect_trend_m15_direction(m15_df)
             if m15_dir is None:
@@ -542,80 +521,47 @@ def main():
             trend_source = "M15"
         else:
             trend_dir = h1_trend
+            _ = confirm_trend_m15(m15_df, trend_dir)
 
         trend_label = "LONG" if trend_dir == "LONG" else "SHORT"
 
-        # Market classifiers
-        market_state = market_state_from_adx(adx_h1)
-        trend_strength = trend_strength_from_adx(adx_h1)
-        regime = market_regime(h1_df)
+        # News flag
+        try:
+            high_news = has_high_impact_news_near(symbol_label, now_utc, window_minutes=60)
+        except Exception:
+            high_news = False
 
-        # News flag (safe)
-        high_news = _safe_has_high_impact_news(now_utc)
-
-        # Trigger
+        # Trigger on M5 candle close
         signal = trigger_signal_m5(cached_m5, trend_dir)
         if not signal:
-            logger.info("No M5 trigger signal on candle close, sleeping %ss.", sleep_seconds)
+            logger.info("No M5 trigger signal on candle close.")
             time.sleep(sleep_seconds)
             continue
 
-        # Dynamic TP/SL
         apply_dynamic_tp_sl(signal, h1_df)
 
         setup_type = signal.extra.get("setup_type", "GENERIC")
         adx_m5 = float(signal.extra.get("adx_m5", 0.0))
+        m5_rsi = float(signal.extra.get("m5_rsi", 50.0))
+        plus_di_m5 = float(signal.extra.get("plus_di_m5", 0.0))
+        minus_di_m5 = float(signal.extra.get("minus_di_m5", 0.0))
 
-        # --- Filters (Exhaustion + M15 veto) ---
-        exhausted, exhausted_reason = h1_exhaustion_veto(h1_df, trend_dir, setup_type)
-        vetoed, veto_reason = m15_veto(m15_df, trend_dir, setup_type)
-
-        if exhausted:
-            logger.info("Signal blocked: %s", exhausted_reason)
-            time.sleep(sleep_seconds)
-            continue
-
-        if vetoed:
-            logger.info("Signal blocked: %s", veto_reason)
-            time.sleep(sleep_seconds)
-            continue
-
-        # M15 confirmation (bonus/penalty in confidence)
-        m15_confirmed = confirm_trend_m15(m15_df, trend_dir)
-
-        # --- Cooldown protocol ---
-        cooldown_sec = cooldown_seconds_for_setup(setup_type)
-        if last_signal_sent_ts is not None:
-            elapsed = time.time() - last_signal_sent_ts
-            if elapsed < cooldown_sec:
-                logger.info(
-                    "Cooldown active (%ss remaining). Skipping signal.",
-                    int(cooldown_sec - elapsed),
-                )
-                time.sleep(sleep_seconds)
-                continue
-
-        # Dedup (avoid duplicate sends for same candle/setup/dir)
-        signal_key = f"{setup_type}|{signal.direction}|{signal.time.isoformat()}"
-        if last_signal_key == signal_key:
-            logger.info("Duplicate signal key detected; skipping.")
-            time.sleep(sleep_seconds)
-            continue
-
-        # Confidence (Upgraded engine)
-        conf = compute_confidence(
+        conf = compute_confidence_adaptive(
             trend_source=trend_source,
             setup_type=setup_type,
             adx_h1=adx_h1,
             adx_m5=adx_m5,
             high_news=high_news,
-            market_regime_text=regime,
-            m15_confirmed=m15_confirmed,
-            h1_exhausted=exhausted,
+            m5_rsi=m5_rsi,
+            plus_di_m5=plus_di_m5,
+            minus_di_m5=minus_di_m5,
         )
         conf_text = confidence_label(conf)
 
-        # Message (YOUR template)
+        market_state = market_state_from_adx(adx_h1)
+        trend_strength = trend_strength_from_adx(adx_h1)
+        regime = market_regime(h1_df)
+
         msg = build_signal_message(
             symbol_label=symbol_label,
             signal=signal,
@@ -632,18 +578,30 @@ def main():
         )
 
         telegram.send_message(msg)
+        logger.info("Signal sent: dir=%s setup=%s conf=%s", trend_label, setup_type, conf)
 
-        last_signal_sent_ts = time.time()
-        last_signal_key = signal_key
+        # Create active trade + journal
+        sl = float(signal.extra["sl"])
+        tp1 = float(signal.extra["tp1"])
+        tp2 = float(signal.extra["tp2"])
 
-        logger.info(
-            "Signal sent. Trend source=%s direction=%s setup=%s confidence=%s (%s)",
-            trend_source,
-            trend_label,
-            setup_type,
-            conf,
-            conf_text,
+        trade = ActiveTrade(
+            trade_id=new_trade_id(),
+            opened_time=signal.time if signal.time.tzinfo else signal.time.replace(tzinfo=dt.timezone.utc),
+            direction=signal.direction,
+            setup_type=setup_type,
+            entry=float(signal.price),
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
+            confidence=conf,
+            trend_source=trend_source,
+            invalidation_deadline=(now_utc + dt.timedelta(minutes=10)),  # 2 candles on M5-ish
         )
+        journal.append_open(trade)
+
+        active_trade = trade
+        last_signal_time = now_utc
 
         time.sleep(sleep_seconds)
 
