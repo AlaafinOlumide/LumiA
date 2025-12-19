@@ -350,7 +350,7 @@ def main():
             high_news = False
 
         # 8) Trigger M5 signal (only on candle close)
-        signal = trigger_signal_m5(cached_m5, trend_dir)
+        signal = trigger_signal_m5(cached_m5, trend_dir, m15_df=m15_df)
         if not signal:
             logger.info("No M5 trigger signal on candle close. Sleeping %ss.", settings.poll_seconds)
             time.sleep(settings.poll_seconds)
