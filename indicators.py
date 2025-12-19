@@ -1,18 +1,15 @@
+# indicators.py
 import pandas as pd
-
 
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
-
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = (delta.clip(lower=0)).rolling(window=period).mean()
     loss = (-delta.clip(upper=0)).rolling(window=period).mean()
     rs = gain / loss
-    rsi_val = 100 - (100 / (1 + rs))
-    return rsi_val
-
+    return 100 - (100 / (1 + rs))
 
 def bollinger_bands(series: pd.Series, period: int = 20, std_factor: float = 2.0):
     ma = series.rolling(window=period).mean()
@@ -20,7 +17,6 @@ def bollinger_bands(series: pd.Series, period: int = 20, std_factor: float = 2.0
     upper = ma + std_factor * std
     lower = ma - std_factor * std
     return upper, ma, lower
-
 
 def stochastic_oscillator(
     high: pd.Series,
@@ -35,11 +31,7 @@ def stochastic_oscillator(
     d = k.rolling(window=d_period).mean()
     return k, d
 
-
 def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
-    """
-    Simplified ADX implementation.
-    """
     plus_dm = high.diff()
     minus_dm = low.diff().abs() * -1
     plus_dm[plus_dm < 0] = 0
@@ -57,7 +49,6 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
     adx_series = dx.rolling(window=period).mean()
     return adx_series, plus_di, minus_di
 
-
 def bullish_engulfing(open_: pd.Series, close: pd.Series):
     prev_open = open_.shift(1)
     prev_close = close.shift(1)
@@ -65,7 +56,6 @@ def bullish_engulfing(open_: pd.Series, close: pd.Series):
     cond_curr_bull = close > open_
     cond_engulf = (close >= prev_open) & (open_ <= prev_close)
     return cond_prev_bear & cond_curr_bull & cond_engulf
-
 
 def bearish_engulfing(open_: pd.Series, close: pd.Series):
     prev_open = open_.shift(1)
@@ -75,11 +65,7 @@ def bearish_engulfing(open_: pd.Series, close: pd.Series):
     cond_engulf = (close <= prev_open) & (open_ >= prev_close)
     return cond_prev_bull & cond_curr_bear & cond_engulf
 
-
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """
-    Average True Range (ATR).
-    """
     high_low = high - low
     high_close_prev = (high - close.shift()).abs()
     low_close_prev = (low - close.shift()).abs()
