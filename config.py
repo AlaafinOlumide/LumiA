@@ -2,46 +2,35 @@
 import os
 from dataclasses import dataclass
 
-
 @dataclass
 class Settings:
     telegram_bot_token: str
     telegram_chat_id: str
     twelvedata_api_key: str
 
-    # Twelve Data symbol
+    # TwelveData symbol (FX format)
     xau_symbol_td: str = "XAU/USD"
 
-    # Trading windows in UTC (HHMM)
+    # Trading window (UTC HHMM)
     session_1_start: int = 700
     session_1_end: int = 2000
-    session_2_start: int = 0
-    session_2_end: int = 0
 
-    # Polling / fetching
-    poll_seconds: int = 60                # loop sleep
-    fetch_interval_seconds: int = 120     # fetch every 2 mins (your request)
+    # Weekend filter (fixes weekend signals)
+    trade_weekends: bool = False  # <-- IMPORTANT
 
-    # Cooldown
+    # Candle / polling
+    sleep_seconds: int = 60
+    fetch_interval_seconds: int = 180  # data fetch cadence (not “signal cadence”)
+
+    # Cooldown (prevents spam + revenge signals)
     cooldown_minutes: int = 20
+    cooldown_same_direction_only: bool = False  # if True: block only same direction
 
-    # Market open filter
-    block_weekends: bool = True
-    # Many brokers reopen Sunday night (UTC). Keep simple & safe:
-    sunday_open_hour_utc: int = 22        # allow trading only after 22:00 UTC Sunday
+    # Entry gate
+    min_entry_score: int = 7  # 0..10
 
-    # Invalidation
-    invalidation_minutes: int = 20        # how long after entry we allow invalidation checks
-
-    # Journal (live + backtest)
-    journal_csv_path: str = "trades.csv"
-    journal_rolling_n: int = 60
-
-
-def _get_bool(name: str, default: bool) -> bool:
-    v = os.environ.get(name, str(default)).strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
-
+    # News
+    news_window_minutes: int = 60
 
 def load_settings() -> Settings:
     return Settings(
@@ -51,12 +40,11 @@ def load_settings() -> Settings:
         xau_symbol_td=os.environ.get("XAU_SYMBOL_TWELVE", "XAU/USD"),
         session_1_start=int(os.environ.get("SESSION_1_START", "700")),
         session_1_end=int(os.environ.get("SESSION_1_END", "2000")),
-        poll_seconds=int(os.environ.get("POLL_SECONDS", "60")),
-        fetch_interval_seconds=int(os.environ.get("FETCH_INTERVAL_SECONDS", "120")),
+        trade_weekends=str(os.environ.get("TRADE_WEEKENDS", "false")).lower() in {"1","true","yes"},
+        sleep_seconds=int(os.environ.get("SLEEP_SECONDS", "60")),
+        fetch_interval_seconds=int(os.environ.get("FETCH_INTERVAL_SECONDS", "180")),
         cooldown_minutes=int(os.environ.get("COOLDOWN_MINUTES", "20")),
-        block_weekends=_get_bool("BLOCK_WEEKENDS", True),
-        sunday_open_hour_utc=int(os.environ.get("SUNDAY_OPEN_HOUR_UTC", "22")),
-        invalidation_minutes=int(os.environ.get("INVALIDATION_MINUTES", "20")),
-        journal_csv_path=os.environ.get("JOURNAL_CSV_PATH", "trades.csv"),
-        journal_rolling_n=int(os.environ.get("JOURNAL_ROLLING_N", "60")),
+        cooldown_same_direction_only=str(os.environ.get("COOLDOWN_SAME_DIR_ONLY", "false")).lower() in {"1","true","yes"},
+        min_entry_score=int(os.environ.get("MIN_ENTRY_SCORE", "7")),
+        news_window_minutes=int(os.environ.get("NEWS_WINDOW_MINUTES", "60")),
     )
