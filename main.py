@@ -1,5 +1,6 @@
 # main.py
 import time
+import uuid
 import logging
 import datetime as dt
 from typing import Optional
@@ -25,16 +26,22 @@ from strategy import (
 )
 
 from signal_formatter import build_signal_message
-from journal import (
-    new_signal_id,
-    append_open_signal,
-    load_open_signals,
+from data_logger import (
+    append_signal_open,
     update_signal_close,
-    evaluate_outcome_on_m5,
+    get_open_signals,
+    safe_float,
+    safe_dt_iso_to_utc,
 )
 
 logger = logging.getLogger("xauusd_bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+
+def _iso(t: dt.datetime) -> str:
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t.astimezone(dt.timezone.utc).isoformat()
 
 
 def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -72,146 +79,173 @@ def trend_strength_from_adx(adx_h1: float) -> str:
 def in_cooldown(now_utc: dt.datetime, last_signal_time: Optional[dt.datetime], cooldown_minutes: int) -> bool:
     if not last_signal_time:
         return False
-    return (now_utc - last_signal_time).total_seconds() < (cooldown_minutes * 60)
+    return (now_utc - last_signal_time).total_seconds() < cooldown_minutes * 60
 
 
-def _iso(dtobj: dt.datetime) -> str:
-    if dtobj.tzinfo is None:
-        dtobj = dtobj.replace(tzinfo=dt.timezone.utc)
-    return dtobj.astimezone(dt.timezone.utc).isoformat()
-
-
-def _safe_float(x, default=0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return float(default)
-
-
-def _run_journal_evaluation(settings, cached_m5: pd.DataFrame, telegram: TelegramClient) -> None:
+def _simulate_hit_order_conservative(direction: str, bar_high: float, bar_low: float, sl: float, tp1: float, tp2: float) -> Optional[str]:
     """
-    For OPEN signals:
-      - wait eval_delay_minutes
-      - then check if SL/TP1/TP2 got hit on M5
-      - close if hit OR if max_hold exceeded
+    If TP and SL both touched inside same bar, we treat it as SL first (conservative).
     """
-    open_df = load_open_signals(settings.journal_path)
-    if open_df is None or open_df.empty:
+    direction = direction.upper()
+    if direction == "LONG":
+        sl_hit = bar_low <= sl
+        tp1_hit = bar_high >= tp1
+        tp2_hit = bar_high >= tp2
+        if sl_hit:
+            return "SL"
+        if tp2_hit:
+            return "TP2"
+        if tp1_hit:
+            return "TP1"
+        return None
+
+    if direction == "SHORT":
+        sl_hit = bar_high >= sl
+        tp1_hit = bar_low <= tp1
+        tp2_hit = bar_low <= tp2
+        if sl_hit:
+            return "SL"
+        if tp2_hit:
+            return "TP2"
+        if tp1_hit:
+            return "TP1"
+        return None
+
+    return None
+
+
+def _run_journal_evaluation(
+    *,
+    settings,
+    cached_m5: pd.DataFrame,
+    now_utc: dt.datetime,
+    telegram: TelegramClient,
+) -> None:
+    """
+    DROP 2:
+    - Check open signals and mark TP1/TP2/SL
+    - Expire after max_hold_minutes
+    """
+    open_signals = get_open_signals(settings.journal_path)
+    if not open_signals:
         return
 
-    now_utc = dt.datetime.now(dt.timezone.utc)
+    # Ensure datetime UTC
+    m5 = cached_m5.copy()
+    m5["datetime"] = pd.to_datetime(m5["datetime"], utc=True)
 
-    for _, row in open_df.iterrows():
-        try:
-            signal_id = str(row["signal_id"])
-            entry_time_iso = str(row["time_utc"])
-            entry_time = dt.datetime.fromisoformat(entry_time_iso)
-            if entry_time.tzinfo is None:
-                entry_time = entry_time.replace(tzinfo=dt.timezone.utc)
-            entry_time = entry_time.astimezone(dt.timezone.utc)
+    for row in open_signals:
+        signal_id = row.get("signal_id", "")
+        direction = str(row.get("direction", "")).upper()
+        entry_time = safe_dt_iso_to_utc(row.get("entry_time_utc", ""))
 
-            age_min = (now_utc - entry_time).total_seconds() / 60.0
+        if not signal_id or not direction or entry_time is None:
+            continue
 
-            # not ready yet
-            if age_min < settings.eval_delay_minutes:
-                continue
+        entry = safe_float(row.get("entry"))
+        sl = safe_float(row.get("sl"))
+        tp1 = safe_float(row.get("tp1"))
+        tp2 = safe_float(row.get("tp2"))
 
-            # expired
-            if age_min >= settings.max_hold_minutes:
-                # exit at latest close
-                last_close = float(cached_m5["close"].iloc[-1])
-                entry = _safe_float(row["entry"])
-                sl = _safe_float(row["sl"])
-                risk = abs(entry - sl) if abs(entry - sl) > 1e-9 else 1.0
-                direction = str(row["direction"])
-                pnl_r = ((last_close - entry) / risk) if direction == "LONG" else ((entry - last_close) / risk
+        # Slice bars AFTER entry time (strictly greater)
+        future = m5[m5["datetime"] > pd.Timestamp(entry_time)]
+        if future.empty:
+            # still no future bars to evaluate
+            continue
 
-                update_signal_close(
-                    settings.journal_path,
-                    signal_id,
-                    result="EXPIRED",
-                    hit_time_utc=_iso(now_utc),
-                    exit_price=last_close,
-                    pnl_r=pnl_r,
-                    notes=f"Expired after {settings.max_hold_minutes}m",
-                )
-                telegram.send_message(f"📒 Journal update: {signal_id} -> EXPIRED | pnl ≈ {pnl_r:.2f}R")
-                continue
+        # Expiry check
+        age_min = (now_utc - entry_time).total_seconds() / 60.0
+        if age_min >= settings.max_hold_minutes:
+            last_close = float(m5["close"].iloc[-1])
+            risk = abs(entry - sl)
+            if risk <= 1e-9:
+                risk = 1.0
+            pnl_r = ((last_close - entry) / risk) if direction == "LONG" else ((entry - last_close) / risk)
 
-            # evaluate hits
-            direction = str(row["direction"])
-            entry = _safe_float(row["entry"])
-            sl = _safe_float(row["sl"])
-            tp1 = _safe_float(row["tp1"])
-            tp2 = _safe_float(row["tp2"])
-
-            result, hit_time, exit_price, pnl_r, notes = evaluate_outcome_on_m5(
-                cached_m5,
-                direction=direction,
-                entry_time_utc_iso=entry_time_iso,
-                entry=entry,
-                sl=sl,
-                tp1=tp1,
-                tp2=tp2,
+            update_signal_close(
+                settings.journal_path,
+                signal_id,
+                result="EXPIRED",
+                hit_time_utc=_iso(now_utc),
+                exit_price=last_close,
+                pnl_r=pnl_r,
+                notes=f"Expired after {settings.max_hold_minutes}m",
             )
+            if settings.journal_notify_telegram:
+                telegram.send_message(f"📒 Journal: {signal_id} -> EXPIRED | pnl ≈ {pnl_r:.2f}R")
+            continue
 
-            # only close if SL/TP1/TP2 hit (NOT NONE)
-            if result in {"SL", "TP1", "TP2"}:
-                update_signal_close(
-                    settings.journal_path,
-                    signal_id,
-                    result=result,
-                    hit_time_utc=_iso(hit_time) if hit_time else "",
-                    exit_price=exit_price,
-                    pnl_r=pnl_r,
-                    notes=notes,
-                )
-                telegram.send_message(f"📒 Journal update: {signal_id} -> {result} | pnl ≈ {pnl_r:.2f}R")
-        except Exception as e:
-            logger.warning("Journal evaluation error: %s", e)
+        # Scan bars chronologically
+        for _, b in future.iterrows():
+            bar_high = float(b["high"])
+            bar_low = float(b["low"])
+
+            hit = _simulate_hit_order_conservative(direction, bar_high, bar_low, sl, tp1, tp2)
+            if not hit:
+                continue
+
+            # Determine exit + pnl_r
+            if hit == "SL":
+                exit_price = sl
+            elif hit == "TP2":
+                exit_price = tp2
+            else:
+                exit_price = tp1
+
+            risk = abs(entry - sl)
+            if risk <= 1e-9:
+                risk = 1.0
+
+            pnl_r = ((exit_price - entry) / risk) if direction == "LONG" else ((entry - exit_price) / risk)
+
+            update_signal_close(
+                settings.journal_path,
+                signal_id,
+                result=hit,
+                hit_time_utc=_iso(now_utc),
+                exit_price=exit_price,
+                pnl_r=pnl_r,
+                notes=f"Hit {hit}",
+            )
+            if settings.journal_notify_telegram:
+                telegram.send_message(f"📒 Journal: {signal_id} -> {hit} | pnl ≈ {pnl_r:.2f}R")
+            break
 
 
 def main():
     settings = load_settings()
+
     symbol_td = settings.xau_symbol_td
     symbol_label = "XAUUSD"
 
     telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id)
 
-    logger.info("Starting XAUUSD bot (Drop1+Drop2+Journaling integrated).")
+    logger.info("Starting XAUUSD bot (H1 primary, M15 fallback) + score gate + journaling + invalidation.")
 
     last_fetch_ts: float = 0.0
     cached_m5: Optional[pd.DataFrame] = None
-    last_closed_m5_time: Optional[pd.Timestamp] = None
 
+    last_closed_m5_time: Optional[pd.Timestamp] = None
     last_signal_time: Optional[dt.datetime] = None
     last_signal_dir: Optional[str] = None
-
-    score_weights = {
-        "score_m15_structure": settings.score_m15_structure,
-        "score_pullback_zone": settings.score_pullback_zone,
-        "score_rsi_reset": settings.score_rsi_reset,
-        "score_stoch_reset": settings.score_stoch_reset,
-        "score_rejection": settings.score_rejection,
-        "score_adx_ok": settings.score_adx_ok,
-        "score_no_news": settings.score_no_news,
-    }
 
     while True:
         now_utc = dt.datetime.now(dt.timezone.utc)
 
+        # Session + weekend filter (your strategy.is_within_sessions should support trade_weekends)
         if not is_within_sessions(
             now_utc=now_utc,
             session_1_start=settings.session_1_start,
             session_1_end=settings.session_1_end,
-            session_2_start=settings.session_2_start,
-            session_2_end=settings.session_2_end,
+            session_2_start=None,
+            session_2_end=None,
             trade_weekends=settings.trade_weekends,
         ):
             logger.info("Outside trading session/weekend filter, sleeping %ss...", settings.sleep_seconds)
             time.sleep(settings.sleep_seconds)
             continue
 
+        # Fetch/cache
         need_fetch = (time.time() - last_fetch_ts) >= settings.fetch_interval_seconds or cached_m5 is None
         if need_fetch:
             logger.info("Fetching fresh M5 OHLCV data from Twelve Data...")
@@ -225,11 +259,16 @@ def main():
             time.sleep(settings.sleep_seconds)
             continue
 
-        # Run journaling evaluation every loop (cheap)
-        _run_journal_evaluation(settings, cached_m5, telegram)
+        # Run journaling evaluation every loop once we have data
+        _run_journal_evaluation(
+            settings=settings,
+            cached_m5=cached_m5,
+            now_utc=now_utc,
+            telegram=telegram,
+        )
 
-        # New candle detection
-        current_last_time = cached_m5["datetime"].iloc[-1]
+        # New candle detection (evaluate only on a new CLOSED M5 candle)
+        current_last_time = pd.to_datetime(cached_m5["datetime"].iloc[-1], utc=True)
         if last_closed_m5_time is not None and current_last_time == last_closed_m5_time:
             logger.info("No new M5 candle closed yet (last=%s). Sleeping %ss...", last_closed_m5_time, settings.sleep_seconds)
             time.sleep(settings.sleep_seconds)
@@ -238,7 +277,7 @@ def main():
         last_closed_m5_time = current_last_time
         logger.info("New M5 candle detected: %s — evaluating signal...", last_closed_m5_time)
 
-        # Resample
+        # Resample for H1 + M15
         m15_df = resample_ohlc(cached_m5, "15min")
         h1_df = resample_ohlc(cached_m5, "1h")
 
@@ -251,7 +290,7 @@ def main():
         adx_h1_series, _, _ = indicators.adx(h1_df["high"], h1_df["low"], h1_df["close"], period=14)
         adx_h1 = float(adx_h1_series.iloc[-1]) if pd.notna(adx_h1_series.iloc[-1]) else 0.0
 
-        # Trend
+        # Trend detection
         h1_trend = detect_trend_h1(h1_df)
         trend_source = "H1"
 
@@ -267,13 +306,13 @@ def main():
             trend_dir = h1_trend
             _ = confirm_trend_m15(m15_df, trend_dir)
 
-        # News
+        # News flag
         try:
             high_news = has_high_impact_news_near(symbol_label, now_utc, window_minutes=settings.news_window_minutes)
         except Exception:
             high_news = False
 
-        # Cooldown
+        # Cooldown protocol
         if in_cooldown(now_utc, last_signal_time, settings.cooldown_minutes):
             if settings.cooldown_same_direction_only and last_signal_dir and last_signal_dir != trend_dir:
                 pass
@@ -282,7 +321,7 @@ def main():
                 time.sleep(settings.sleep_seconds)
                 continue
 
-        # Trigger
+        # Trigger (must include score gate inside strategy.trigger_signal_m5)
         signal = trigger_signal_m5(
             m5_df=cached_m5,
             trend_dir=trend_dir,
@@ -290,21 +329,51 @@ def main():
             h1_df=h1_df,
             high_news=high_news,
             min_score=settings.min_entry_score,
-            score_weights=score_weights,
         )
+
         if not signal:
             logger.info("No M5 trigger signal on candle close, sleeping %ss.", settings.sleep_seconds)
             time.sleep(settings.sleep_seconds)
             continue
 
+        # DROP 2: invalidate existing open signals if opposite direction signal appears
+        if settings.invalidate_on_opposite_signal:
+            open_signals = get_open_signals(settings.journal_path)
+            for row in open_signals:
+                if str(row.get("direction", "")).upper() != signal.direction.upper():
+                    # invalidate opposite signal
+                    signal_id = row.get("signal_id", "")
+                    entry = safe_float(row.get("entry"))
+                    sl = safe_float(row.get("sl"))
+                    last_close = float(cached_m5["close"].iloc[-1])
+                    risk = abs(entry - sl)
+                    if risk <= 1e-9:
+                        risk = 1.0
+                    direction = str(row.get("direction", "")).upper()
+                    pnl_r = ((last_close - entry) / risk) if direction == "LONG" else ((entry - last_close) / risk)
+
+                    update_signal_close(
+                        settings.journal_path,
+                        signal_id,
+                        result="INVALIDATED",
+                        hit_time_utc=_iso(now_utc),
+                        exit_price=last_close,
+                        pnl_r=pnl_r,
+                        notes="Invalidated by opposite signal",
+                    )
+                    if settings.journal_notify_telegram:
+                        telegram.send_message(f"📒 Journal: {signal_id} -> INVALIDATED (opposite signal) | pnl ≈ {pnl_r:.2f}R")
+
         # Regime + adaptive TP/SL
         regime = market_regime(h1_df)
         dynamic_tp_sl(signal, h1_df, regime)
 
+        # Market classifiers
         market_state = market_state_from_adx(adx_h1)
         trend_strength = trend_strength_from_adx(adx_h1)
 
-        setup_type = str(signal.extra.get("setup_type", "GENERIC"))
+        # Confidence
+        setup_type = signal.extra.get("setup_type", "GENERIC")
         adx_m5 = float(signal.extra.get("adx_m5", 0.0))
         entry_score = int(signal.extra.get("entry_score", 0))
 
@@ -318,7 +387,6 @@ def main():
         )
         conf_text = confidence_label(conf)
 
-        # Message
         msg = build_signal_message(
             symbol_label=symbol_label,
             signal=signal,
@@ -333,45 +401,37 @@ def main():
             confidence_score=conf,
             confidence_text=conf_text,
         )
+
         telegram.send_message(msg)
 
-        # Journal OPEN entry
-        sid = new_signal_id()
-        time_iso = _iso(signal.time if isinstance(signal.time, dt.datetime) else now_utc)
-
-        row = {
-            "signal_id": sid,
+        # Journal OPEN
+        signal_id = str(uuid.uuid4())[:8]
+        append_signal_open(settings.journal_path, {
+            "signal_id": signal_id,
             "symbol": symbol_label,
             "direction": signal.direction,
             "setup_type": setup_type,
             "trend_source": trend_source,
-            "trend_dir": trend_dir,
-            "time_utc": time_iso,
-            "entry": float(signal.price),
-            "sl": float(signal.extra.get("sl")),
-            "tp1": float(signal.extra.get("tp1")),
-            "tp2": float(signal.extra.get("tp2")),
-            "entry_score": entry_score,
-            "confidence": conf,
-            "adx_h1": float(adx_h1),
-            "adx_m5": float(adx_m5),
-            "regime": regime,
+            "trend_bias": trend_dir,
+            "entry_time_utc": _iso(now_utc),
+            "entry": f"{signal.price:.5f}",
+            "sl": f"{float(signal.extra.get('sl', 0.0)):.5f}",
+            "tp1": f"{float(signal.extra.get('tp1', 0.0)):.5f}",
+            "tp2": f"{float(signal.extra.get('tp2', 0.0)):.5f}",
+            "confidence": str(conf),
+            "entry_score": str(entry_score),
             "status": "OPEN",
-            "result": "",
-            "hit_time_utc": "",
+            "closed_time_utc": "",
             "exit_price": "",
             "pnl_r": "",
             "notes": "",
-        }
-        append_open_signal(settings.journal_path, row)
-
-        telegram.send_message(f"📌 Signal ID: {sid} (journaled)")
+        })
 
         last_signal_time = now_utc
         last_signal_dir = signal.direction
 
-        logger.info("Signal sent. id=%s source=%s dir=%s setup=%s score=%s conf=%s (%s)",
-                    sid, trend_source, trend_dir, setup_type, entry_score, conf, conf_text)
+        logger.info("Signal sent. source=%s dir=%s setup=%s score=%s conf=%s (%s) id=%s",
+                    trend_source, signal.direction, setup_type, entry_score, conf, conf_text, signal_id)
 
         time.sleep(settings.sleep_seconds)
 
