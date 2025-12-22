@@ -1,15 +1,23 @@
 # strategy.py
-from __future__ import annotations
-
 import datetime as dt
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 
-import indicators
-from indicators import bollinger_bands, rsi, stochastic_oscillator, adx, bullish_engulfing, bearish_engulfing
+from indicators import (
+    bollinger_bands,
+    rsi,
+    stochastic_oscillator,
+    adx,
+    atr,
+    bullish_engulfing,
+    bearish_engulfing,
+)
 
+# -----------------------------------------------------------------------------
+# Data structures
+# -----------------------------------------------------------------------------
 
 @dataclass
 class Signal:
@@ -21,38 +29,54 @@ class Signal:
 
 
 # -----------------------------------------------------------------------------
-# Session helper (includes weekend control)
+# Sessions / trading window
 # -----------------------------------------------------------------------------
+
 def is_within_sessions(
+    *,
     now_utc: dt.datetime,
     session_1_start: int,
     session_1_end: int,
-    session_2_start: Optional[int],
-    session_2_end: Optional[int],
-    trade_weekends: bool,
+    session_2_start: Optional[int] = None,
+    session_2_end: Optional[int] = None,
+    trade_weekends: bool = False,
 ) -> bool:
-    if not trade_weekends and now_utc.weekday() in (5, 6):
-        return False
+    """
+    Time window filter (UTC). Prevents weekends unless trade_weekends=True.
+
+    session_* are HHMM integers. Example: 700 -> 07:00, 2000 -> 20:00
+    """
+    # Weekend block
+    if not trade_weekends:
+        # Monday=0 ... Friday=5 is wrong; Python: Monday=0 .. Sunday=6
+        wd = now_utc.weekday()
+        if wd >= 5:  # 5=Saturday, 6=Sunday
+            return False
 
     hhmm = now_utc.hour * 100 + now_utc.minute
+
     in_s1 = session_1_start <= hhmm <= session_1_end
 
+    in_s2 = False
     if session_2_start is not None and session_2_end is not None:
         in_s2 = session_2_start <= hhmm <= session_2_end
-    else:
-        in_s2 = False
 
     return in_s1 or in_s2
 
 
 # -----------------------------------------------------------------------------
-# EMA + trend
+# Trend detection H1 / direction fallback M15
 # -----------------------------------------------------------------------------
+
 def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
 def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
+    """
+    Higher-timeframe trend using EMA(20/50), RSI(14), and ADX(14).
+    Returns "LONG", "SHORT", or None (ranging/unclear).
+    """
     if h1_df is None or len(h1_df) < 60:
         return None
 
@@ -71,6 +95,7 @@ def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
     r = float(rsi_series.iloc[-1])
     a = float(adx_series.iloc[-1]) if pd.notna(adx_series.iloc[-1]) else 0.0
 
+    # Weak ADX => don't force a direction
     if a < 15:
         return None
 
@@ -78,10 +103,14 @@ def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
         return "LONG"
     if c < e20 < e50 and r < 45:
         return "SHORT"
+
     return None
 
 
 def detect_trend_m15_direction(m15_df: pd.DataFrame) -> Optional[str]:
+    """
+    Fallback direction using M15 (looser thresholds).
+    """
     if m15_df is None or len(m15_df) < 60:
         return None
 
@@ -111,9 +140,15 @@ def detect_trend_m15_direction(m15_df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def confirm_trend_m15(m15_df: pd.DataFrame, trend: str) -> bool:
-    if m15_df is None or len(m15_df) < 40:
-        return False
+def _m15_structure_bias(m15_df: pd.DataFrame) -> str:
+    """
+    Simple structure read on M15:
+      - BULL: EMA20>EMA50, last close > EMA20
+      - BEAR: EMA20<EMA50, last close < EMA20
+      - otherwise RANGE
+    """
+    if m15_df is None or len(m15_df) < 50:
+        return "RANGE"
 
     close = m15_df["close"]
     ema20 = _ema(close, 20)
@@ -123,122 +158,317 @@ def confirm_trend_m15(m15_df: pd.DataFrame, trend: str) -> bool:
     e20 = float(ema20.iloc[-1])
     e50 = float(ema50.iloc[-1])
 
+    if e20 > e50 and c > e20:
+        return "BULL"
+    if e20 < e50 and c < e20:
+        return "BEAR"
+    return "RANGE"
+
+
+def confirm_trend_m15(m15_df: pd.DataFrame, trend: str) -> bool:
+    """
+    Confirm H1 trend using M15 structure (EMA alignment + price location).
+    """
+    bias = _m15_structure_bias(m15_df)
     if trend == "LONG":
-        return e20 > e50 and c > e20
+        return bias == "BULL"
     if trend == "SHORT":
-        return e20 < e50 and c < e20
+        return bias == "BEAR"
     return False
 
 
 # -----------------------------------------------------------------------------
-# M15 structure filter
+# Market regime + adaptive TP/SL
 # -----------------------------------------------------------------------------
-def m15_structure_ok(m15_df: pd.DataFrame, direction: str) -> Tuple[bool, Dict[str, Any]]:
-    if m15_df is None or len(m15_df) < 60:
-        return False, {"m15_structure": "insufficient_data"}
 
-    close = m15_df["close"]
-    open_ = m15_df["open"]
-    ema20 = _ema(close, 20)
-    ema50 = _ema(close, 50)
-
-    c = float(close.iloc[-1])
-    e20 = float(ema20.iloc[-1])
-    e50 = float(ema50.iloc[-1])
-
-    bull_engulf = bool(bullish_engulfing(open_, close).iloc[-1])
-    bear_engulf = bool(bearish_engulfing(open_, close).iloc[-1])
-
-    info = {
-        "m15_close": c,
-        "m15_ema20": e20,
-        "m15_ema50": e50,
-        "m15_bull_engulf": bull_engulf,
-        "m15_bear_engulf": bear_engulf,
-    }
-
-    if direction == "LONG":
-        ok = (e20 > e50) and (c >= e20) and (not bear_engulf)
-        info["m15_structure"] = "ok" if ok else "fail_long"
-        return ok, info
-
-    if direction == "SHORT":
-        ok = (e20 < e50) and (c <= e20) and (not bull_engulf)
-        info["m15_structure"] = "ok" if ok else "fail_short"
-        return ok, info
-
-    return False, {"m15_structure": "bad_direction"}
-
-
-# -----------------------------------------------------------------------------
-# Regime
-# -----------------------------------------------------------------------------
 def market_regime(h1_df: pd.DataFrame) -> str:
-    if h1_df is None or len(h1_df) < 40:
-        return "Normal Volatility"
+    """
+    Label regime from ATR and ADX:
+      - High Volatility: ATR in top tercile or ADX>=25
+      - Low Volatility:  ATR in bottom tercile and ADX<15
+      - otherwise: Normal
+    """
+    if h1_df is None or len(h1_df) < 80:
+        return "Normal"
 
-    atr_series = indicators.atr(h1_df["high"], h1_df["low"], h1_df["close"], period=14)
-    atr = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else 0.0
-    price = float(h1_df["close"].iloc[-1])
-    atr_pct = (atr / price * 100.0) if price > 0 else 0.0
+    high = h1_df["high"]
+    low = h1_df["low"]
+    close = h1_df["close"]
+    atr14 = atr(high, low, close, period=14)
 
-    if atr_pct >= 0.35:
+    adx_series, _, _ = adx(high, low, close, period=14)
+    a = float(adx_series.iloc[-1]) if pd.notna(adx_series.iloc[-1]) else 0.0
+
+    # simple distribution split
+    last_atr = float(atr14.iloc[-1]) if pd.notna(atr14.iloc[-1]) else 0.0
+    if atr14.dropna().empty:
+        return "Normal"
+
+    q33 = float(atr14.quantile(0.33))
+    q66 = float(atr14.quantile(0.66))
+
+    if last_atr >= q66 or a >= 25:
         return "High Volatility"
-    if atr_pct <= 0.20:
-        return "Low Volatility / Compression"
-    return "Normal Volatility"
+    if last_atr <= q33 and a < 15:
+        return "Low Volatility"
+    return "Normal"
+
+
+def dynamic_tp_sl(sig: Signal, h1_df: pd.DataFrame, regime: str) -> None:
+    """
+    Set SL/TP from H1 ATR. Uses R multiples, stored in sig.extra["sl"/"tp1"/"tp2"].
+    """
+    high = h1_df["high"]
+    low = h1_df["low"]
+    close = h1_df["close"]
+    atr14 = atr(high, low, close, period=14)
+    curr_atr = float(atr14.iloc[-1]) if pd.notna(atr14.iloc[-1]) else 10.0
+
+    # ATR multipliers by regime (tighter in low vol, wider in high)
+    if regime == "Low Volatility":
+        sl_mult = 0.6
+    elif regime == "High Volatility":
+        sl_mult = 1.2
+    else:
+        sl_mult = 0.9
+
+    sl_dist = max(curr_atr * sl_mult, 1e-4)  # safety floor
+
+    if sig.direction.upper() == "LONG":
+        sl = sig.price - sl_dist
+        tp1 = sig.price + 1.2 * (sig.price - sl)  # 1.2R
+        tp2 = sig.price + 2.0 * (sig.price - sl)  # 2.0R
+    else:
+        sl = sig.price + sl_dist
+        tp1 = sig.price - 1.2 * (sl - sig.price)
+        tp2 = sig.price - 2.0 * (sl - sig.price)
+
+    sig.extra["sl"] = float(sl)
+    sig.extra["tp1"] = float(tp1)
+    sig.extra["tp2"] = float(tp2)
+    sig.extra["atr_h1"] = curr_atr
+    sig.extra["regime"] = regime
 
 
 # -----------------------------------------------------------------------------
-# Score gate
+# Confidence scoring
 # -----------------------------------------------------------------------------
-def _score_gate(
+
+def compute_confidence(
     *,
-    m15_ok: bool,
-    in_pullback_zone: bool,
-    rsi_reset_ok: bool,
-    stoch_reset_ok: bool,
-    rejection_ok: bool,
-    adx_ok: bool,
-    no_news: bool,
-    weights: Dict[str, int],
-) -> Tuple[int, Dict[str, Any]]:
+    trend_source: str,
+    setup_type: str,
+    adx_h1: float,
+    adx_m5: float,
+    high_news: bool,
+    entry_score: int,
+) -> int:
+    """
+    Convert entry_score + context to a final 0..100 confidence.
+    """
+    score = entry_score
+
+    # Slight boost for H1-driven trend
+    if trend_source == "H1":
+        score += 5
+
+    # ADX(H1) adds confidence
+    if adx_h1 >= 30:
+        score += 5
+    elif adx_h1 >= 20:
+        score += 3
+
+    # ADX(M5) small contribution
+    if adx_m5 >= 25:
+        score += 3
+    elif adx_m5 >= 18:
+        score += 1
+
+    # High impact news reduces confidence
+    if high_news:
+        score -= 8
+
+    # Setup-type small stylistic nudges
+    if setup_type.startswith("BREAKOUT_CONT"):
+        score += 2
+
+    return int(max(0, min(100, score)))
+
+
+def confidence_label(score: int) -> str:
+    if score >= 76:
+        return "High"
+    if score >= 56:
+        return "Medium"
+    return "Low"
+
+
+# -----------------------------------------------------------------------------
+# Trigger engine on M5
+#   - Rewritten Pullback logic
+#   - Fresh Breakout
+#   - Breakout Continuation
+#   - Score-based entry gate
+# -----------------------------------------------------------------------------
+
+def _score_gate_long(
+    *,
+    c: float,
+    o: float,
+    bb_m: float,
+    bb_l: float,
+    rsi_val: float,
+    stoch_k: float,
+    stoch_d: float,
+    stoch_k_prev: float,
+    stoch_d_prev: float,
+    m5_close: pd.Series,
+    adx_m5: float,
+    m15_bias: str,
+    trend_dir: str,
+    candle_bull: bool,
+) -> Tuple[int, str]:
+    """
+    Build a score for LONG pullback/continuation. Returns (score, reason_snippet).
+    """
     score = 0
-    breakdown: Dict[str, Any] = {}
+    reasons = []
 
-    def add(key: str, condition: bool, weight_key: str):
-        nonlocal score
-        pts = weights.get(weight_key, 0) if condition else 0
-        score += pts
-        breakdown[key] = {"ok": condition, "pts": pts}
+    # 1) Trend alignment (M15 structure + overall trend)
+    if trend_dir == "LONG":
+        score += 12
+    if m15_bias == "BULL":
+        score += 10
+    else:
+        reasons.append("M15 not bullish")
 
-    add("m15_structure_ok", m15_ok, "score_m15_structure")
-    add("pullback_zone", in_pullback_zone, "score_pullback_zone")
-    add("rsi_reset", rsi_reset_ok, "score_rsi_reset")
-    add("stoch_reset", stoch_reset_ok, "score_stoch_reset")
-    add("rejection", rejection_ok, "score_rejection")
-    add("adx_ok", adx_ok, "score_adx_ok")
-    add("no_high_news", no_news, "score_no_news")
+    # 2) Location: near mid/lower band
+    if bb_l * 0.995 <= c <= bb_m * 1.005:
+        score += 12
+        reasons.append("Near BB mid/lower")
+    else:
+        reasons.append("Not near BB mid/lower")
 
-    return int(score), breakdown
+    # 3) Momentum turn: stoch cross up
+    if (stoch_k > stoch_d) and (stoch_k_prev <= stoch_d_prev):
+        score += 10
+        reasons.append("Stoch cross up")
+    elif stoch_k > stoch_d:
+        score += 5
+        reasons.append("Stoch > D")
+
+    # 4) RSI healthy
+    if 38 <= rsi_val <= 62:
+        score += 8
+    elif rsi_val > 62:
+        reasons.append("RSI hot")
+    else:
+        reasons.append("RSI cold")
+
+    # 5) Candle confirmation
+    if candle_bull or c > o:
+        score += 8
+        reasons.append("Bullish candle/engulf")
+
+    # 6) M5 micro-trend (EMA20>EMA50)
+    ema20 = _ema(m5_close, 20)
+    ema50 = _ema(m5_close, 50)
+    if float(ema20.iloc[-1]) > float(ema50.iloc[-1]):
+        score += 8
+        reasons.append("M5 EMA20>EMA50")
+
+    # 7) ADX support on M5
+    if adx_m5 >= 23:
+        score += 6
+    elif adx_m5 >= 18:
+        score += 3
+
+    return score, "; ".join(reasons)
 
 
-# -----------------------------------------------------------------------------
-# Trigger on M5 (Pullback rewritten properly)
-# -----------------------------------------------------------------------------
+def _score_gate_short(
+    *,
+    c: float,
+    o: float,
+    bb_m: float,
+    bb_u: float,
+    rsi_val: float,
+    stoch_k: float,
+    stoch_d: float,
+    stoch_k_prev: float,
+    stoch_d_prev: float,
+    m5_close: pd.Series,
+    adx_m5: float,
+    m15_bias: str,
+    trend_dir: str,
+    candle_bear: bool,
+) -> Tuple[int, str]:
+    score = 0
+    reasons = []
+
+    if trend_dir == "SHORT":
+        score += 12
+    if m15_bias == "BEAR":
+        score += 10
+    else:
+        reasons.append("M15 not bearish")
+
+    if bb_m * 0.995 <= c <= bb_u * 1.005:
+        score += 12
+        reasons.append("Near BB mid/upper")
+    else:
+        reasons.append("Not near BB mid/upper")
+
+    if (stoch_k < stoch_d) and (stoch_k_prev >= stoch_d_prev):
+        score += 10
+        reasons.append("Stoch cross down")
+    elif stoch_k < stoch_d:
+        score += 5
+        reasons.append("Stoch < D")
+
+    if 38 <= rsi_val <= 62:
+        score += 8
+    elif rsi_val < 38:
+        reasons.append("RSI cold ok")
+    else:
+        reasons.append("RSI hot")
+
+    if candle_bear or c < o:
+        score += 8
+        reasons.append("Bearish candle/engulf")
+
+    ema20 = _ema(m5_close, 20)
+    ema50 = _ema(m5_close, 50)
+    if float(ema20.iloc[-1]) < float(ema50.iloc[-1]):
+        score += 8
+        reasons.append("M5 EMA20<EMA50")
+
+    if adx_m5 >= 23:
+        score += 6
+    elif adx_m5 >= 18:
+        score += 3
+
+    return score, "; ".join(reasons)
+
+
 def trigger_signal_m5(
+    *,
     m5_df: pd.DataFrame,
     trend_dir: str,
     m15_df: pd.DataFrame,
     h1_df: pd.DataFrame,
     high_news: bool,
     min_score: int,
-    score_weights: Optional[Dict[str, int]] = None,
 ) -> Optional[Signal]:
-    if m5_df is None or len(m5_df) < 120:
+    """
+    Main M5 trigger engine with prioritised setups:
+      1) Pullback (rewritten)
+      2) Fresh Breakout
+      3) Breakout Continuation
+    Uses a **score gate**; returns None if score < min_score.
+    """
+    if m5_df is None or len(m5_df) < 80:
         return None
-    if score_weights is None:
-        score_weights = {}
 
     high = m5_df["high"]
     low = m5_df["low"]
@@ -250,23 +480,20 @@ def trigger_signal_m5(
     stoch_k, stoch_d = stochastic_oscillator(high, low, close, k_period=14, d_period=3)
     adx_series, plus_di, minus_di = adx(high, low, close, period=14)
 
-    bull_engulf_m5 = bullish_engulfing(open_, close)
-    bear_engulf_m5 = bearish_engulfing(open_, close)
+    bull_eng = bullish_engulfing(open_, close)
+    bear_eng = bearish_engulfing(open_, close)
 
+    # latest + previous
     c = float(close.iloc[-1])
     o = float(open_.iloc[-1])
-    h = float(high.iloc[-1])
-    l = float(low.iloc[-1])
+    c_prev = float(close.iloc[-2])
+
+    bb_u = float(bb_upper.iloc[-1]); bb_m = float(bb_mid.iloc[-1]); bb_l = float(bb_lower.iloc[-1])
+    bb_u_prev = float(bb_upper.iloc[-2]); bb_l_prev = float(bb_lower.iloc[-2])
 
     r = float(rsi_series.iloc[-1])
-    k = float(stoch_k.iloc[-1])
-    d = float(stoch_d.iloc[-1])
-    k_prev = float(stoch_k.iloc[-2])
-    d_prev = float(stoch_d.iloc[-2])
-
-    bb_u = float(bb_upper.iloc[-1])
-    bb_m = float(bb_mid.iloc[-1])
-    bb_l = float(bb_lower.iloc[-1])
+    k = float(stoch_k.iloc[-1]); d = float(stoch_d.iloc[-1])
+    k_prev = float(stoch_k.iloc[-2]); d_prev = float(stoch_d.iloc[-2])
 
     adx_m5 = float(adx_series.iloc[-1]) if pd.notna(adx_series.iloc[-1]) else 0.0
     plus_di_m5 = float(plus_di.iloc[-1]) if pd.notna(plus_di.iloc[-1]) else 0.0
@@ -276,11 +503,8 @@ def trigger_signal_m5(
     if isinstance(bar_time, pd.Timestamp):
         bar_time = bar_time.to_pydatetime()
 
-    # M15 structure filter
-    m15_ok, m15_info = m15_structure_ok(m15_df, trend_dir)
-
+    m15_bias = _m15_structure_bias(m15_df)
     extra_common = {
-        "setup_type": None,
         "m5_rsi": r,
         "m5_stoch_k": k,
         "m5_stoch_d": d,
@@ -290,247 +514,154 @@ def trigger_signal_m5(
         "adx_m5": adx_m5,
         "plus_di_m5": plus_di_m5,
         "minus_di_m5": minus_di_m5,
-        **m15_info,
+        "m15_bias": m15_bias,
     }
 
-    def _rejection_bullish() -> bool:
-        body = abs(c - o)
-        rng = max(1e-9, (h - l))
-        lower_wick = min(o, c) - l
-        lower_wick_ratio = lower_wick / rng
-        return (c > o) or bool(bull_engulf_m5.iloc[-1]) or (lower_wick_ratio >= 0.40 and body / rng <= 0.45)
-
-    def _rejection_bearish() -> bool:
-        body = abs(c - o)
-        rng = max(1e-9, (h - l))
-        upper_wick = h - max(o, c)
-        upper_wick_ratio = upper_wick / rng
-        return (c < o) or bool(bear_engulf_m5.iloc[-1]) or (upper_wick_ratio >= 0.40 and body / rng <= 0.45)
-
-    def _pullback_long() -> Optional[Signal]:
-        in_zone = (c <= bb_m) or (l <= bb_m)
-        rsi_reset_ok = r <= 45.0
-        stoch_reset_ok = (k_prev < 30.0 or d_prev < 30.0) and (k > d) and (k_prev <= d_prev)
-        rejection_ok = _rejection_bullish()
-        adx_ok = adx_m5 >= 18.0 and plus_di_m5 >= minus_di_m5
-        no_news = not high_news
-
-        score, breakdown = _score_gate(
-            m15_ok=m15_ok,
-            in_pullback_zone=in_zone,
-            rsi_reset_ok=rsi_reset_ok,
-            stoch_reset_ok=stoch_reset_ok,
-            rejection_ok=rejection_ok,
-            adx_ok=adx_ok,
-            no_news=no_news,
-            weights=score_weights,
+    # -------------------------------------------------------------------------
+    # 1) PULLBACK (rewritten)
+    # -------------------------------------------------------------------------
+    def _pullback_long() -> Optional[Tuple[Signal, int]]:
+        candle_ok = (c > o) or bool(bull_eng.iloc[-1])
+        score, why = _score_gate_long(
+            c=c, o=o, bb_m=bb_m, bb_l=bb_l, rsi_val=r,
+            stoch_k=k, stoch_d=d, stoch_k_prev=k_prev, stoch_d_prev=d_prev,
+            m5_close=close, adx_m5=adx_m5, m15_bias=m15_bias, trend_dir=trend_dir,
+            candle_bull=candle_ok
         )
-
-        if score < min_score:
-            return None
-
-        if in_zone and rsi_reset_ok and stoch_reset_ok and rejection_ok and m15_ok:
+        if score >= min_score and trend_dir == "LONG":
             extra = dict(extra_common)
             extra["setup_type"] = "PULLBACK_LONG"
             extra["entry_score"] = score
-            extra["score_breakdown"] = breakdown
-            reason = "Pullback LONG: BB mid touch/close + RSI reset <=45 + stoch <30 cross up + rejection + M15 structure."
-            return Signal("LONG", c, bar_time, reason, extra)
+            reason = f"Pullback LONG: confluence [{why}]"
+            return Signal("LONG", c, bar_time, reason, extra), score
         return None
 
-    def _pullback_short() -> Optional[Signal]:
-        in_zone = (c >= bb_m) or (h >= bb_m)
-        rsi_reset_ok = r >= 55.0
-        stoch_reset_ok = (k_prev > 70.0 or d_prev > 70.0) and (k < d) and (k_prev >= d_prev)
-        rejection_ok = _rejection_bearish()
-        adx_ok = adx_m5 >= 18.0 and minus_di_m5 >= plus_di_m5
-        no_news = not high_news
-
-        score, breakdown = _score_gate(
-            m15_ok=m15_ok,
-            in_pullback_zone=in_zone,
-            rsi_reset_ok=rsi_reset_ok,
-            stoch_reset_ok=stoch_reset_ok,
-            rejection_ok=rejection_ok,
-            adx_ok=adx_ok,
-            no_news=no_news,
-            weights=score_weights,
+    def _pullback_short() -> Optional[Tuple[Signal, int]]:
+        candle_ok = (c < o) or bool(bear_eng.iloc[-1])
+        score, why = _score_gate_short(
+            c=c, o=o, bb_m=bb_m, bb_u=bb_u, rsi_val=r,
+            stoch_k=k, stoch_d=d, stoch_k_prev=k_prev, stoch_d_prev=d_prev,
+            m5_close=close, adx_m5=adx_m5, m15_bias=m15_bias, trend_dir=trend_dir,
+            candle_bear=candle_ok
         )
-
-        if score < min_score:
-            return None
-
-        if in_zone and rsi_reset_ok and stoch_reset_ok and rejection_ok and m15_ok:
+        if score >= min_score and trend_dir == "SHORT":
             extra = dict(extra_common)
             extra["setup_type"] = "PULLBACK_SHORT"
             extra["entry_score"] = score
-            extra["score_breakdown"] = breakdown
-            reason = "Pullback SHORT: BB mid touch/close + RSI reset >=55 + stoch >70 cross down + rejection + M15 structure."
-            return Signal("SHORT", c, bar_time, reason, extra)
+            reason = f"Pullback SHORT: confluence [{why}]"
+            return Signal("SHORT", c, bar_time, reason, extra), score
         return None
 
-    def _breakout_cont_long() -> Optional[Signal]:
-        riding_upper = c >= bb_u * 0.998
-        adx_ok = adx_m5 >= 22.0 and plus_di_m5 > minus_di_m5
-        no_news = not high_news
+    # -------------------------------------------------------------------------
+    # 2) FRESH BREAKOUT
+    # -------------------------------------------------------------------------
+    def _breakout_long() -> Optional[Tuple[Signal, int]]:
+        prev_inside = c_prev <= bb_u_prev * 0.999
+        now_break = c > bb_u * 1.001
+        stoch_ok = k >= 55
+        rsi_ok = r >= 52
+        adx_ok = adx_m5 >= 18
 
-        score, breakdown = _score_gate(
-            m15_ok=m15_ok,
-            in_pullback_zone=riding_upper,
-            rsi_reset_ok=(r >= 52.0),
-            stoch_reset_ok=(k >= 55.0),
-            rejection_ok=True,
-            adx_ok=adx_ok,
-            no_news=no_news,
-            weights=score_weights,
-        )
-        if score < min_score:
-            return None
+        score = 0
+        if trend_dir == "LONG": score += 10
+        if m15_bias == "BULL": score += 8
+        if prev_inside and now_break: score += 14
+        if stoch_ok: score += 6
+        if rsi_ok: score += 6
+        if adx_ok: score += 5
 
-        if riding_upper and adx_ok and m15_ok and r >= 52.0:
+        if score >= min_score:
+            extra = dict(extra_common)
+            extra["setup_type"] = "BREAKOUT_LONG"
+            extra["entry_score"] = score
+            reason = "Breakout LONG: upper BB break with momentum."
+            return Signal("LONG", c, bar_time, reason, extra), score
+        return None
+
+    def _breakout_short() -> Optional[Tuple[Signal, int]]:
+        prev_inside = c_prev >= bb_l_prev * 1.001
+        now_break = c < bb_l * 0.999
+        stoch_ok = k <= 45
+        rsi_ok = r <= 48
+        adx_ok = adx_m5 >= 18
+
+        score = 0
+        if trend_dir == "SHORT": score += 10
+        if m15_bias == "BEAR": score += 8
+        if prev_inside and now_break: score += 14
+        if stoch_ok: score += 6
+        if rsi_ok: score += 6
+        if adx_ok: score += 5
+
+        if score >= min_score:
+            extra = dict(extra_common)
+            extra["setup_type"] = "BREAKOUT_SHORT"
+            extra["entry_score"] = score
+            reason = "Breakout SHORT: lower BB break with momentum."
+            return Signal("SHORT", c, bar_time, reason, extra), score
+        return None
+
+    # -------------------------------------------------------------------------
+    # 3) BREAKOUT CONTINUATION
+    # -------------------------------------------------------------------------
+    def _breakout_cont_long() -> Optional[Tuple[Signal, int]]:
+        riding_upper = c >= bb_u * 0.999
+        adx_ok = adx_m5 >= 20 and plus_di_m5 > minus_di_m5
+
+        score = 0
+        if trend_dir == "LONG": score += 10
+        if m15_bias == "BULL": score += 8
+        if riding_upper: score += 10
+        if adx_ok: score += 8
+
+        if score >= min_score:
             extra = dict(extra_common)
             extra["setup_type"] = "BREAKOUT_CONT_LONG"
             extra["entry_score"] = score
-            extra["score_breakdown"] = breakdown
-            reason = "Breakout continuation LONG: riding upper BB + ADX +DI dominance + M15 structure."
-            return Signal("LONG", c, bar_time, reason, extra)
+            reason = "Breakout continuation LONG: riding upper band with ADX support."
+            return Signal("LONG", c, bar_time, reason, extra), score
         return None
 
-    def _breakout_cont_short() -> Optional[Signal]:
-        riding_lower = c <= bb_l * 1.002
-        adx_ok = adx_m5 >= 22.0 and minus_di_m5 > plus_di_m5
-        no_news = not high_news
+    def _breakout_cont_short() -> Optional[Tuple[Signal, int]]:
+        riding_lower = c <= bb_l * 1.001
+        adx_ok = adx_m5 >= 20 and minus_di_m5 > plus_di_m5
 
-        score, breakdown = _score_gate(
-            m15_ok=m15_ok,
-            in_pullback_zone=riding_lower,
-            rsi_reset_ok=(r <= 48.0),
-            stoch_reset_ok=(k <= 45.0),
-            rejection_ok=True,
-            adx_ok=adx_ok,
-            no_news=no_news,
-            weights=score_weights,
-        )
-        if score < min_score:
-            return None
+        score = 0
+        if trend_dir == "SHORT": score += 10
+        if m15_bias == "BEAR": score += 8
+        if riding_lower: score += 10
+        if adx_ok: score += 8
 
-        if riding_lower and adx_ok and m15_ok and r <= 48.0:
+        if score >= min_score:
             extra = dict(extra_common)
             extra["setup_type"] = "BREAKOUT_CONT_SHORT"
             extra["entry_score"] = score
-            extra["score_breakdown"] = breakdown
-            reason = "Breakout continuation SHORT: riding lower BB + ADX -DI dominance + M15 structure."
-            return Signal("SHORT", c, bar_time, reason, extra)
+            reason = "Breakout continuation SHORT: riding lower band with ADX support."
+            return Signal("SHORT", c, bar_time, reason, extra), score
         return None
 
+    # Prioritise: Pullback → Breakout → Continuation, in the current trend_dir
+    candidates: list[Tuple[Signal, int]] = []
+
     if trend_dir == "LONG":
-        return _pullback_long() or _breakout_cont_long()
-    if trend_dir == "SHORT":
-        return _pullback_short() or _breakout_cont_short()
+        for f in (_pullback_long, _breakout_long, _breakout_cont_long):
+            out = f()
+            if out:
+                candidates.append(out)
+    elif trend_dir == "SHORT":
+        for f in (_pullback_short, _breakout_short, _breakout_cont_short):
+            out = f()
+            if out:
+                candidates.append(out)
 
-    return None
+    if not candidates:
+        return None
 
+    # Choose highest score
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    best = candidates[0][0]
 
-# -----------------------------------------------------------------------------
-# TP/SL + management (Drop 2 integrated)
-# -----------------------------------------------------------------------------
-def dynamic_tp_sl(signal: Signal, h1_df: pd.DataFrame, regime: str) -> None:
-    if h1_df is None or len(h1_df) < 40:
-        return
+    # Light news filter (don’t block, but mark)
+    best.extra["news_flag"] = bool(high_news)
 
-    atr_series = indicators.atr(h1_df["high"], h1_df["low"], h1_df["close"], period=14)
-    atr = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else 0.0
-    if atr <= 0:
-        return
-
-    entry = float(signal.price)
-
-    # Regime-based targets (fixes “TP not hit” on compression days)
-    if "Low Volatility" in regime:
-        tp1_r, tp2_r = 0.8, 1.6
-        sl_mult = 1.1
-        trail_r = 0.6
-    elif "High Volatility" in regime:
-        tp1_r, tp2_r = 1.5, 2.5
-        sl_mult = 1.4
-        trail_r = 1.0
-    else:
-        tp1_r, tp2_r = 1.2, 2.0
-        sl_mult = 1.2
-        trail_r = 0.8
-
-    sl_dist = atr * sl_mult
-
-    if signal.direction == "LONG":
-        sl = entry - sl_dist
-        risk = entry - sl
-        tp1 = entry + (tp1_r * risk)
-        tp2 = entry + (tp2_r * risk)
-    else:
-        sl = entry + sl_dist
-        risk = sl - entry
-        tp1 = entry - (tp1_r * risk)
-        tp2 = entry - (tp2_r * risk)
-
-    signal.extra["atr_h1"] = atr
-    signal.extra["sl"] = sl
-    signal.extra["tp1"] = tp1
-    signal.extra["tp2"] = tp2
-    signal.extra["rr_tp1"] = f"{tp1_r:.2f}"
-    signal.extra["rr_tp2"] = f"{tp2_r:.2f}"
-
-    mgmt = []
-    mgmt.append("Management:")
-    mgmt.append(f"- TP1: take 50% off at {tp1_r:.2f}R, move SL to breakeven.")
-    mgmt.append(f"- After TP1: trail using ~{trail_r:.2f}R behind price (or trail beyond M5 swing).")
-    mgmt.append("- If strong close back through BB mid against position, consider early exit.")
-    signal.extra["management_notes"] = "\n".join(mgmt)
-
-
-# -----------------------------------------------------------------------------
-# Confidence (uses entry_score)
-# -----------------------------------------------------------------------------
-def compute_confidence(
-    trend_source: str,
-    setup_type: str,
-    adx_h1: float,
-    adx_m5: float,
-    high_news: bool,
-    entry_score: int,
-) -> int:
-    base = 50
-
-    base += 8 if trend_source == "H1" else 4
-    if "PULLBACK" in setup_type:
-        base += 6
-    if "BREAKOUT_CONT" in setup_type:
-        base += 4
-
-    if adx_h1 >= 35:
-        base += 10
-    elif adx_h1 >= 25:
-        base += 7
-    elif adx_h1 >= 20:
-        base += 4
-    else:
-        base -= 5
-
-    if adx_m5 >= 30:
-        base += 6
-    elif adx_m5 >= 22:
-        base += 3
-
-    base += int(min(20, max(0, entry_score - 60) * 0.5))
-
-    if high_news:
-        base -= 15
-
-    return max(1, min(99, int(base)))
-
-
-def confidence_label(conf: int) -> str:
-    if conf >= 80:
-        return "High"
-    if conf >= 65:
-        return "Medium"
-    return "Low"
+    return best
