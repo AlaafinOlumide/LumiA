@@ -1,4 +1,4 @@
-requests
-python-dotenv
-pandas
-numpy
+requests==2.32.5
+python-dotenv==1.2.1
+pandas==2.3.3
+numpy==2.4.0
