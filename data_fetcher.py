@@ -1,43 +1,48 @@
-# data_fetcher.py
-import logging
-import pandas as pd
 import requests
+import pandas as pd
+from datetime import timezone
+import logging
 
-logger = logging.getLogger(__name__)
-TD_BASE_URL = "https://api.twelvedata.com/time_series"
+log = logging.getLogger("data_fetcher")
 
-def fetch_ohlcv_twelvedata(api_key: str, symbol: str, interval: str, outputsize: int = 1200) -> pd.DataFrame:
+TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
+
+def fetch_ohlcv(symbol: str, interval: str, apikey: str, outputsize: int = 300) -> pd.DataFrame:
+    """
+    Returns DataFrame indexed by UTC timestamp with columns:
+    open, high, low, close, volume
+    """
     params = {
         "symbol": symbol,
         "interval": interval,
-        "apikey": api_key,
+        "apikey": apikey,
         "outputsize": outputsize,
-        "timezone": "UTC",
         "format": "JSON",
+        "timezone": "UTC",
     }
-    logger.info("Calling Twelve Data for %s interval %s", symbol, interval)
-    r = requests.get(TD_BASE_URL, params=params, timeout=15)
+    log.info("Calling Twelve Data for %s interval %s", symbol, interval)
+    r = requests.get(TWELVEDATA_URL, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
-    if "values" not in data:
-        raise RuntimeError(f"Twelve Data response missing 'values': {data}")
 
-    df = pd.DataFrame(data["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-    df = df.dropna(subset=["datetime"])
+    if "status" in data and data["status"] == "error":
+        raise RuntimeError(f"TwelveData error: {data.get('message')}")
 
-    for col in ("open", "high", "low", "close"):
-        df[col] = df[col].astype(float)
+    values = data.get("values", [])
+    if not values:
+        raise RuntimeError("No OHLCV returned from TwelveData.")
 
+    df = pd.DataFrame(values)
+    # TwelveData returns strings; convert
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    for c in ["open", "high", "low", "close"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     if "volume" in df.columns:
-        df["volume"] = df["volume"].astype(float)
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
     else:
         df["volume"] = 0.0
 
-    df = df.sort_values("datetime").reset_index(drop=True)
+    df = df.sort_values("datetime").set_index("datetime")
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    df.index = df.index.tz_convert(timezone.utc)
     return df
-
-def fetch_m5_ohlcv_twelvedata(symbol: str, api_key: str) -> pd.DataFrame:
-    if not api_key:
-        raise RuntimeError("Twelve Data API key missing; cannot fetch data.")
-    return fetch_ohlcv_twelvedata(api_key=api_key, symbol=symbol, interval="5min", outputsize=1200)
