@@ -1,145 +1,62 @@
-# indicators.py
-import pandas as pd
 import numpy as np
+import pandas as pd
 
+def ema(series: pd.Series, n: int) -> pd.Series:
+    return series.ewm(span=n, adjust=False).mean()
 
-# -----------------------------------------------------------------------------
-# Moving averages
-# -----------------------------------------------------------------------------
-
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-# -----------------------------------------------------------------------------
-# RSI
-# -----------------------------------------------------------------------------
-
-def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+def rsi(close: pd.Series, n: int = 14) -> pd.Series:
     delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    up = delta.clip(lower=0.0)
+    down = (-delta).clip(lower=0.0)
+    roll_up = up.ewm(alpha=1/n, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/n, adjust=False).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50.0)
 
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
+def stoch_kd(high: pd.Series, low: pd.Series, close: pd.Series, k_n: int = 14, d_n: int = 3, smooth: int = 3):
+    ll = low.rolling(k_n).min()
+    hh = high.rolling(k_n).max()
+    k = 100 * (close - ll) / (hh - ll).replace(0, np.nan)
+    k = k.rolling(smooth).mean()
+    d = k.rolling(d_n).mean()
+    return k.fillna(50.0), d.fillna(50.0)
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi_val = 100 - (100 / (1 + rs))
-    return rsi_val.fillna(50)
-
-
-# -----------------------------------------------------------------------------
-# Bollinger Bands
-# -----------------------------------------------------------------------------
-
-def bollinger_bands(
-    close: pd.Series,
-    period: int = 20,
-    std_factor: float = 2.0,
-):
-    mid = close.rolling(period).mean()
-    std = close.rolling(period).std()
-
-    upper = mid + std_factor * std
-    lower = mid - std_factor * std
-    return upper, mid, lower
-
-
-# -----------------------------------------------------------------------------
-# Stochastic Oscillator
-# -----------------------------------------------------------------------------
-
-def stochastic_oscillator(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    k_period: int = 14,
-    d_period: int = 3,
-):
-    lowest_low = low.rolling(k_period).min()
-    highest_high = high.rolling(k_period).max()
-
-    k = 100 * (close - lowest_low) / (highest_high - lowest_low)
-    d = k.rolling(d_period).mean()
-
-    return k.fillna(50), d.fillna(50)
-
-
-# -----------------------------------------------------------------------------
-# ATR (Average True Range)
-# -----------------------------------------------------------------------------
-
-def atr(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    period: int = 14,
-) -> pd.Series:
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
     prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    atr_val = tr.ewm(alpha=1/n, adjust=False).mean()
+    # replaces deprecated fillna(method="bfill")
+    return atr_val.bfill()
 
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
+def bollinger(close: pd.Series, n: int = 20, k: float = 2.0):
+    mid = close.rolling(n).mean()
+    std = close.rolling(n).std(ddof=0)
+    upper = mid + k * std
+    lower = mid - k * std
+    return upper.bfill(), mid.bfill(), lower.bfill()
 
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr_val = tr.rolling(period).mean()
-    return atr_val.fillna(method="bfill")
-
-
-# -----------------------------------------------------------------------------
-# ADX (+DI / -DI)
-# -----------------------------------------------------------------------------
-
-def adx(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    period: int = 14,
-):
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14):
+    # Minimal ADX implementation (good enough for regime gating)
     up_move = high.diff()
-    down_move = low.diff().abs()
+    down_move = -low.diff()
 
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    tr = atr(high, low, close, period)
+    tr = pd.concat([
+        (high - low),
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs()
+    ], axis=1).max(axis=1)
 
-    plus_di = 100 * pd.Series(plus_dm).rolling(period).mean() / tr
-    minus_di = 100 * pd.Series(minus_dm).rolling(period).mean() / tr
-
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-    adx_val = dx.rolling(period).mean()
-
-    return (
-        adx_val.fillna(0),
-        plus_di.fillna(0),
-        minus_di.fillna(0),
-    )
-
-
-# -----------------------------------------------------------------------------
-# Candlestick patterns
-# -----------------------------------------------------------------------------
-
-def bullish_engulfing(open_: pd.Series, close: pd.Series) -> pd.Series:
-    prev_open = open_.shift(1)
-    prev_close = close.shift(1)
-
-    return (
-        (close > open_) &
-        (prev_close < prev_open) &
-        (close >= prev_open) &
-        (open_ <= prev_close)
-    )
-
-
-def bearish_engulfing(open_: pd.Series, close: pd.Series) -> pd.Series:
-    prev_open = open_.shift(1)
-    prev_close = close.shift(1)
-
-    return (
-        (close < open_) &
-        (prev_close > prev_open) &
-        (close <= prev_open) &
-        (open_ >= prev_close)
-    )
+    atr_n = tr.ewm(alpha=1/n, adjust=False).mean().replace(0, np.nan)
+    plus_di = 100 * pd.Series(plus_dm, index=high.index).ewm(alpha=1/n, adjust=False).mean() / atr_n
+    minus_di = 100 * pd.Series(minus_dm, index=high.index).ewm(alpha=1/n, adjust=False).mean() / atr_n
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
+    adx_v = dx.ewm(alpha=1/n, adjust=False).mean().bfill()
+    return adx_v, plus_di.bfill(), minus_di.bfill()
