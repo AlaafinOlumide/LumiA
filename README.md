@@ -11,8 +11,7 @@ This bot:
   - M15: trend confirmation (EMA + RSI)
   - H1: trend detection (EMA + ADX + DI)
 - Only looks for trades during:
-  - 08:00–10:00 UTC and
-  - 12:00–16:00 UTC
+  - 08:00–19:00 UTC
 - Sends signals to a Telegram chat
 - Logs each signal into `signals_log.csv`
 - Flags high-impact ForexFactory news near the signal time
