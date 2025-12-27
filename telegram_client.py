@@ -1,21 +1,17 @@
-# telegram_client.py
-import logging
 import requests
+import logging
 
-logger = logging.getLogger("telegram_client")
+log = logging.getLogger("telegram")
 
-class TelegramClient:
-    def __init__(self, bot_token: str, chat_id: str):
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-        self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
-
-    def send_message(self, text: str) -> None:
-        url = f"{self.base_url}/sendMessage"
-        payload = {"chat_id": self.chat_id, "text": text}
-        try:
-            resp = requests.post(url, json=payload, timeout=10)
-            if not resp.ok:
-                logger.error("Failed to send Telegram message: %s - %s", resp.status_code, resp.text)
-        except Exception as e:
-            logger.exception("Error sending Telegram message: %s", e)
+def send_message(bot_token: str, chat_id: str, text: str) -> None:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(url, json=payload, timeout=20)
+    if not r.ok:
+        log.error("Telegram send failed: %s %s", r.status_code, r.text)
+        r.raise_for_status()
