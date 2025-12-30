@@ -1,156 +1,272 @@
+# main.py
+from __future__ import annotations
+
 import time
 import logging
+import datetime as dt
+from typing import Optional
+
 import pandas as pd
 
-from config import Config
-from data_fetcher import fetch_ohlcv
-from strategy import generate_signal
-from telegram_client import send_message
-from storage import load_state, save_state
-from journal import open_journal_entry, update_journal_status, append_csv
+from config import load_settings
+from data_fetcher import fetch_m5_ohlcv_twelvedata
+from telegram_client import TelegramClient
+from high_impact_news import has_high_impact_news_near
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+import indicators
+from strategy import (
+    is_within_sessions,
+    detect_trend_h1,
+    detect_trend_m15_direction,
+    confirm_trend_m15,
+    trigger_signal_m5,
+    market_regime,
+    dynamic_tp_sl,
+    compute_confidence,
+    confidence_label,
 )
-log = logging.getLogger("xauusd_bot")
 
-def fmt_signal(sig) -> str:
-    return (
-        f"<b>{sig.symbol} Signal [SCALP]</b>\n"
-        f"<b>{sig.direction}</b> {sig.symbol} at <b>{sig.entry:.2f}</b>\n\n"
-        f"SL: {sig.sl:.2f}\n"
-        f"TP1: {sig.tp1:.2f}\n"
-        f"TP2: {sig.tp2:.2f}\n\n"
-        f"Setup: {sig.setup}\n"
-        f"Entry Score: {sig.score}\n"
-        f"Confidence: {sig.confidence}\n\n"
-        f"Time (UTC): {sig.candle_time.to_pydatetime().isoformat()}\n"
-        f"Trend Bias: {sig.trend_bias}\n"
-        f"{sig.notes}"
-    )
+from signal_formatter import build_signal_message
 
-def _dedupe_key(sig) -> str:
-    # prevents “2 in 1” (same candle re-sent)
-    return f"{sig.symbol}|{sig.tf}|{sig.candle_time.isoformat()}|{sig.setup}|{sig.direction}"
+logger = logging.getLogger("xauusd_bot")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-def run_loop() -> None:
-    cfg = Config()
-    state = load_state(cfg.STATE_PATH)
 
-    last_seen_candle = pd.to_datetime(state.get("last_seen_candle")) if state.get("last_seen_candle") else None
-    last_sent_ts = float(state.get("last_sent_ts", 0.0))
-    sent_keys = set(state.get("sent_keys", []))  # small set persisted
-    open_trade = state.get("open_trade")         # dict version of JournalEntry
+def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    tmp = df.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True)
+    tmp = tmp.set_index("datetime")
+
+    agg = tmp.resample(rule).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    ).dropna()
+
+    return agg.reset_index()
+
+
+def market_state_from_adx(adx_h1: float) -> str:
+    return "TRENDING" if adx_h1 >= 20 else "RANGING"
+
+
+def trend_strength_from_adx(adx_h1: float) -> str:
+    if adx_h1 >= 35:
+        return "Very Strong"
+    if adx_h1 >= 25:
+        return "Strong"
+    if adx_h1 >= 20:
+        return "Moderate"
+    if adx_h1 >= 15:
+        return "Weak"
+    return "Very Weak"
+
+
+def in_cooldown(now_utc: dt.datetime, last_signal_time: Optional[dt.datetime], cooldown_minutes: int) -> bool:
+    if not last_signal_time:
+        return False
+    return (now_utc - last_signal_time).total_seconds() < (cooldown_minutes * 60)
+
+
+def cooldown_minutes_for_regime(adx_h1: float, default_minutes: int) -> int:
+    # PATCH: regime-based cooldown
+    if adx_h1 >= 35:
+        return 20
+    if adx_h1 >= 25:
+        return 12
+    if adx_h1 >= 20:
+        return 10
+    return default_minutes
+
+
+def main():
+    settings = load_settings()
+
+    symbol_td = settings.xau_symbol_td
+    symbol_label = "XAUUSD"
+
+    telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id)
+
+    logger.info("Starting XAUUSD bot (H1 primary, M15 fallback) + score gate + impulse continuation + liquidity filter.")
+
+    last_fetch_ts: float = 0.0
+    cached_m5: Optional[pd.DataFrame] = None
+
+    last_closed_m5_time: Optional[pd.Timestamp] = None
+    last_signal_time: Optional[dt.datetime] = None
+    last_signal_dir: Optional[str] = None
 
     while True:
+        now_utc = dt.datetime.now(dt.timezone.utc)
+
+        # ------------------------------------------------------------------
+        # PATCH #1: Hard trading window enforcement (prevents night signals)
+        # ------------------------------------------------------------------
+        if not (settings.hard_session_start_hour_utc <= now_utc.hour < settings.hard_session_end_hour_utc):
+            logger.info("Outside HARD window %02d:00-%02d:00 UTC. Sleeping %ss...",
+                        settings.hard_session_start_hour_utc, settings.hard_session_end_hour_utc, settings.sleep_seconds)
+            time.sleep(settings.sleep_seconds)
+            continue
+
+        # ------------------------------------------------------------------
+        # PATCH #2: Session helper (kept) + weekend filter
+        # ------------------------------------------------------------------
+        if not is_within_sessions(
+            now_utc=now_utc,
+            session_1_start=settings.session_1_start,
+            session_1_end=settings.session_1_end,
+            session_2_start=None,
+            session_2_end=None,
+            trade_weekends=settings.trade_weekends,
+        ):
+            logger.info("Outside session/weekend filter. Sleeping %ss...", settings.sleep_seconds)
+            time.sleep(settings.sleep_seconds)
+            continue
+
+        # fetch / cache
+        need_fetch = (time.time() - last_fetch_ts) >= settings.fetch_interval_seconds or cached_m5 is None
+        if need_fetch:
+            logger.info("Fetching fresh M5 OHLCV data from Twelve Data...")
+            cached_m5 = fetch_m5_ohlcv_twelvedata(symbol=symbol_td, api_key=settings.twelvedata_api_key)
+            last_fetch_ts = time.time()
+        else:
+            logger.info("Using cached M5 OHLCV data.")
+
+        if cached_m5 is None or len(cached_m5) < 300:
+            logger.warning("Not enough M5 data yet. Sleeping %ss...", settings.sleep_seconds)
+            time.sleep(settings.sleep_seconds)
+            continue
+
+        # Only evaluate on new CLOSED candle
+        current_last_time = cached_m5["datetime"].iloc[-1]
+        if last_closed_m5_time is not None and current_last_time == last_closed_m5_time:
+            logger.info("No new M5 candle closed yet (last=%s). Sleeping %ss...", last_closed_m5_time, settings.sleep_seconds)
+            time.sleep(settings.sleep_seconds)
+            continue
+
+        last_closed_m5_time = current_last_time
+        logger.info("New M5 candle detected: %s — evaluating signal...", last_closed_m5_time)
+
+        # resample
+        m15_df = resample_ohlc(cached_m5, "15min")
+        h1_df = resample_ohlc(cached_m5, "1h")
+
+        if len(h1_df) < 60 or len(m15_df) < 60:
+            logger.info("Not enough data after resampling, sleeping %ss...", settings.sleep_seconds)
+            time.sleep(settings.sleep_seconds)
+            continue
+
+        # ADX(H1)
+        adx_h1_series, _, _ = indicators.adx(h1_df["high"], h1_df["low"], h1_df["close"], period=14)
+        adx_h1 = float(adx_h1_series.iloc[-1]) if pd.notna(adx_h1_series.iloc[-1]) else 0.0
+
+        # trend detection
+        h1_trend = detect_trend_h1(h1_df)
+        trend_source = "H1"
+
+        if h1_trend is None:
+            m15_dir = detect_trend_m15_direction(m15_df)
+            if m15_dir is None:
+                logger.info("No clear H1 trend and no clear M15 direction, skipping.")
+                time.sleep(settings.sleep_seconds)
+                continue
+            trend_dir = m15_dir
+            trend_source = "M15"
+        else:
+            trend_dir = h1_trend
+            _ = confirm_trend_m15(m15_df, trend_dir)
+
+        # news
         try:
-            df5 = fetch_ohlcv(cfg.SYMBOL, cfg.TF_TRIGGER, cfg.TWELVEDATA_API_KEY, cfg.LOOKBACK)
-            dftrend = fetch_ohlcv(cfg.SYMBOL, cfg.TF_TREND, cfg.TWELVEDATA_API_KEY, cfg.LOOKBACK)
+            high_news = has_high_impact_news_near(symbol_label, now_utc, window_minutes=settings.news_window_minutes)
+        except Exception:
+            high_news = False
 
-            if len(df5) < 60:
-                log.info("Not enough data yet. Sleeping 60s...")
-                time.sleep(60)
+        # ------------------------------------------------------------------
+        # PATCH #3: Regime-based cooldown (stops over-firing)
+        # ------------------------------------------------------------------
+        cooldown_minutes = (
+            cooldown_minutes_for_regime(adx_h1, settings.cooldown_minutes_default)
+            if settings.use_regime_based_cooldown
+            else settings.cooldown_minutes_default
+        )
+
+        if in_cooldown(now_utc, last_signal_time, cooldown_minutes):
+            if settings.cooldown_same_direction_only and last_signal_dir and last_signal_dir != trend_dir:
+                pass
+            else:
+                logger.info("Cooldown active (%sm). Skipping this candle.", cooldown_minutes)
+                time.sleep(settings.sleep_seconds)
                 continue
 
-            candle_time = df5.index[-1]
-            last_close = float(df5["close"].iloc[-1])
+        # trigger with score gate + liquidity filter + impulse continuation
+        signal = trigger_signal_m5(
+            m5_df=cached_m5,
+            trend_dir=trend_dir,
+            m15_df=m15_df,
+            h1_df=h1_df,
+            high_news=high_news,
+            min_score=settings.min_entry_score,
+            range_filter_lookback=settings.range_filter_lookback,
+            range_filter_min_ratio=settings.range_filter_min_ratio,
+        )
 
-            # journal update on every new candle close (or even same, harmless)
-            if open_trade:
-                from journal import JournalEntry
-                je = JournalEntry(**open_trade)
-                je = update_journal_status(
-                    je,
-                    last_close_time=candle_time,
-                    last_close=last_close,
-                    min_risk_points=cfg.MIN_RISK_POINTS,
-                    max_abs_r=cfg.MAX_ABS_R_MULTIPLE
-                )
-                if je.status != "OPEN":
-                    # Send journal update + write CSV
-                    msg = f"📒 Journal: {je.trade_id} -> {je.status} | pnl ≈ {je.r_multiple:.2f}R"
-                    send_message(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, msg)
-                    append_csv(cfg.JOURNAL_CSV, je.__dict__)
-                    open_trade = None
-                    state["open_trade"] = None
-                    save_state(cfg.STATE_PATH, state)
+        if not signal:
+            logger.info("No M5 trigger signal on candle close, sleeping %ss.", settings.sleep_seconds)
+            time.sleep(settings.sleep_seconds)
+            continue
 
-            # Only evaluate on a NEW candle close
-            if last_seen_candle is not None and candle_time <= last_seen_candle:
-                log.info("No new candle closed yet (last=%s). Sleeping 60s...", last_seen_candle)
-                time.sleep(60)
-                continue
+        # regime + dynamic TP/SL
+        regime = market_regime(h1_df)
+        dynamic_tp_sl(signal, h1_df, regime)
 
-            log.info("New candle detected: %s — evaluating...", candle_time)
+        # market classifiers
+        market_state = market_state_from_adx(adx_h1)
+        trend_strength = trend_strength_from_adx(adx_h1)
 
-            sig = generate_signal(
-                symbol=cfg.SYMBOL,
-                tf_trigger=cfg.TF_TRIGGER,
-                df_trigger=df5,
-                df_trend=dftrend,
-                min_atr_points=cfg.MIN_ATR_POINTS,
-                min_bb_width_points=cfg.MIN_BB_WIDTH_POINTS,
-                rr_tp1=cfg.RR_TP1,
-                rr_tp2=cfg.RR_TP2,
-                min_risk_points=cfg.MIN_RISK_POINTS
-            )
+        # confidence
+        setup_type = signal.extra.get("setup_type", "GENERIC")
+        adx_m5 = float(signal.extra.get("adx_m5", 0.0))
+        entry_score = int(signal.extra.get("entry_score", 0))
 
-            # mark candle as processed
-            last_seen_candle = candle_time
-            state["last_seen_candle"] = candle_time.isoformat()
+        conf = compute_confidence(
+            trend_source=trend_source,
+            setup_type=setup_type,
+            adx_h1=adx_h1,
+            adx_m5=adx_m5,
+            high_news=high_news,
+            entry_score=entry_score,
+        )
+        conf_text = confidence_label(conf)
 
-            # If no signal, persist and sleep
-            if sig is None:
-                save_state(cfg.STATE_PATH, state)
-                time.sleep(60)
-                continue
+        msg = build_signal_message(
+            symbol_label=symbol_label,
+            signal=signal,
+            trend_label=trend_dir,
+            trend_source=trend_source,
+            session_window=f"{settings.hard_session_start_hour_utc:02d}:00-{settings.hard_session_end_hour_utc:02d}:00",
+            high_news=high_news,
+            market_state=market_state,
+            market_regime_text=regime,
+            adx_h1=adx_h1,
+            trend_strength=trend_strength,
+            confidence_score=conf,
+            confidence_text=conf_text,
+        )
 
-            # Cooldown (prevents spam)
-            now = time.time()
-            if (now - last_sent_ts) < cfg.COOLDOWN_SECONDS:
-                log.info("Cooldown active; skipping signal send.")
-                save_state(cfg.STATE_PATH, state)
-                time.sleep(60)
-                continue
+        telegram.send_message(msg)
+        last_signal_time = now_utc
+        last_signal_dir = signal.direction
 
-            # Dedupe: one per candle / per setup / per direction
-            key = _dedupe_key(sig)
-            if key in sent_keys:
-                log.info("Duplicate signal key; skipping send.")
-                save_state(cfg.STATE_PATH, state)
-                time.sleep(60)
-                continue
+        logger.info(
+            "Signal sent. source=%s dir=%s setup=%s score=%s conf=%s (%s)",
+            trend_source, trend_dir, setup_type, entry_score, conf, conf_text
+        )
 
-            # Also: if a trade is already open, don’t open another (reduces overtrading)
-            if open_trade is not None:
-                log.info("Trade still OPEN; skipping new signal.")
-                save_state(cfg.STATE_PATH, state)
-                time.sleep(60)
-                continue
+        time.sleep(settings.sleep_seconds)
 
-            # Send signal
-            send_message(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, fmt_signal(sig))
-
-            # Open journal entry immediately (signal-only tracking)
-            je = open_journal_entry(sig, cfg.SIGNAL_EXPIRY_MINUTES)
-            open_trade = je.__dict__
-            state["open_trade"] = open_trade
-
-            # update state (cap sent_keys size)
-            sent_keys.add(key)
-            if len(sent_keys) > 500:
-                sent_keys = set(list(sent_keys)[-300:])
-            state["sent_keys"] = list(sent_keys)
-
-            state["last_sent_ts"] = now
-
-            save_state(cfg.STATE_PATH, state)
-            time.sleep(60)
-
-        except Exception as e:
-            log.exception("Loop error: %s", e)
-            time.sleep(60)
 
 if __name__ == "__main__":
-    run_loop()
+    main()
