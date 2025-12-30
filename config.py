@@ -1,43 +1,83 @@
+# config.py
+from __future__ import annotations
+
 from dataclasses import dataclass
+from dotenv import load_dotenv
 import os
 
-def _env(name: str, default: str | None = None) -> str:
-    v = os.getenv(name, default)
-    if v is None or v == "":
-        raise RuntimeError(f"Missing required env var: {name}")
-    return v
 
-@dataclass(frozen=True)
-class Config:
-    # Data
-    TWELVEDATA_API_KEY: str = _env("TWELVEDATA_API_KEY")
-    SYMBOL: str = os.getenv("SYMBOL", "XAU/USD")
-    # Candle timeframe used to trigger entries
-    TF_TRIGGER: str = os.getenv("TF_TRIGGER", "5min")  # 5min
-    # Confirmation timeframe for trend bias
-    TF_TREND: str = os.getenv("TF_TREND", "15min")     # 15min or 1h
-    LOOKBACK: int = int(os.getenv("LOOKBACK", "300"))
+@dataclass
+class Settings:
+    # --- API / symbols ---
+    twelvedata_api_key: str
+    xau_symbol_td: str = "XAU/USD"
 
-    # Telegram
-    TELEGRAM_BOT_TOKEN: str = _env("TELEGRAM_BOT_TOKEN")
-    TELEGRAM_CHAT_ID: str = _env("TELEGRAM_CHAT_ID")
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
-    # Risk model (signal-only; journaling uses these)
-    RR_TP1: float = float(os.getenv("RR_TP1", "1.2"))
-    RR_TP2: float = float(os.getenv("RR_TP2", "2.0"))
+    # --- run-loop ---
+    sleep_seconds: int = 60
+    fetch_interval_seconds: int = 180  # refresh TD data every N seconds
 
-    # Anti-spam / filtering (these fix your “4479.6 spam” issue)
-    COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "900"))  # 15 min
-    MIN_ATR_POINTS: float = float(os.getenv("MIN_ATR_POINTS", "4.0"))  # stop micro volatility
-    MIN_BB_WIDTH_POINTS: float = float(os.getenv("MIN_BB_WIDTH_POINTS", "6.0"))
+    # --- trading window (UTC) ---
+    # Hard window (MOST IMPORTANT) – prevents night signals even if helper is bypassed
+    hard_session_start_hour_utc: int = 7
+    hard_session_end_hour_utc: int = 20  # exclusive (7 <= hour < 20)
 
-    # Expiry (if TP/SL not hit, close journal at expiry using last close)
-    SIGNAL_EXPIRY_MINUTES: int = int(os.getenv("SIGNAL_EXPIRY_MINUTES", "60"))
+    # Optional HHMM session helper (kept for message formatting + future split sessions)
+    session_1_start: int = 700
+    session_1_end: int = 2000
 
-    # Journal + storage paths (Render-friendly)
-    STATE_PATH: str = os.getenv("STATE_PATH", "state.json")
-    JOURNAL_CSV: str = os.getenv("JOURNAL_CSV", "journal.csv")
+    # weekend filter
+    trade_weekends: bool = False
 
-    # Safety clamps
-    MIN_RISK_POINTS: float = float(os.getenv("MIN_RISK_POINTS", "2.0"))  # prevents -75R nonsense
-    MAX_ABS_R_MULTIPLE: float = float(os.getenv("MAX_ABS_R_MULTIPLE", "6.0"))
+    # --- news ---
+    news_window_minutes: int = 60
+
+    # --- signal gating ---
+    min_entry_score: int = 70
+
+    # Liquidity / range filter (removes most low-quality night chop)
+    range_filter_lookback: int = 20
+    range_filter_min_ratio: float = 0.60  # last_range must be >= 0.60 * avg_range
+
+    # --- cooldown ---
+    cooldown_same_direction_only: bool = False
+    cooldown_minutes_default: int = 10  # fallback if regime-based not used
+
+    # If True, cooldown minutes are selected based on ADX(H1)
+    use_regime_based_cooldown: bool = True
+
+
+def _get_env(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return v if v is not None else default
+
+
+def load_settings() -> Settings:
+    load_dotenv()
+
+    api_key = _get_env("TWELVEDATA_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("Missing TWELVEDATA_API_KEY in environment (.env or Render env vars).")
+
+    return Settings(
+        twelvedata_api_key=api_key,
+        xau_symbol_td=_get_env("XAU_SYMBOL_TD", "XAU/USD"),
+        telegram_bot_token=_get_env("TELEGRAM_BOT_TOKEN", ""),
+        telegram_chat_id=_get_env("TELEGRAM_CHAT_ID", ""),
+        sleep_seconds=int(_get_env("SLEEP_SECONDS", "60")),
+        fetch_interval_seconds=int(_get_env("FETCH_INTERVAL_SECONDS", "180")),
+        hard_session_start_hour_utc=int(_get_env("HARD_SESSION_START_HOUR_UTC", "7")),
+        hard_session_end_hour_utc=int(_get_env("HARD_SESSION_END_HOUR_UTC", "20")),
+        session_1_start=int(_get_env("SESSION_1_START", "700")),
+        session_1_end=int(_get_env("SESSION_1_END", "2000")),
+        trade_weekends=_get_env("TRADE_WEEKENDS", "false").lower() in ("1", "true", "yes", "y"),
+        news_window_minutes=int(_get_env("NEWS_WINDOW_MINUTES", "60")),
+        min_entry_score=int(_get_env("MIN_ENTRY_SCORE", "70")),
+        range_filter_lookback=int(_get_env("RANGE_FILTER_LOOKBACK", "20")),
+        range_filter_min_ratio=float(_get_env("RANGE_FILTER_MIN_RATIO", "0.60")),
+        cooldown_same_direction_only=_get_env("COOLDOWN_SAME_DIRECTION_ONLY", "false").lower() in ("1", "true", "yes"),
+        cooldown_minutes_default=int(_get_env("COOLDOWN_MINUTES_DEFAULT", "10")),
+        use_regime_based_cooldown=_get_env("USE_REGIME_BASED_COOLDOWN", "true").lower() in ("1", "true", "yes"),
+    )
