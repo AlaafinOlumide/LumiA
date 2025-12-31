@@ -1,272 +1,266 @@
-# main.py
+# strategy.py
 from __future__ import annotations
 
-import time
-import logging
+from dataclasses import dataclass, field
 import datetime as dt
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import pandas as pd
 
-from config import load_settings
-from data_fetcher import fetch_m5_ohlcv_twelvedata
-from telegram_client import TelegramClient
-from high_impact_news import has_high_impact_news_near
-
 import indicators
-from strategy import (
-    is_within_sessions,
-    detect_trend_h1,
-    detect_trend_m15_direction,
-    confirm_trend_m15,
-    trigger_signal_m5,
-    market_regime,
-    dynamic_tp_sl,
-    compute_confidence,
-    confidence_label,
-)
-
-from signal_formatter import build_signal_message
-
-logger = logging.getLogger("xauusd_bot")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
-def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    tmp = df.copy()
-    tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True)
-    tmp = tmp.set_index("datetime")
-
-    agg = tmp.resample(rule).agg(
-        open=("open", "first"),
-        high=("high", "max"),
-        low=("low", "min"),
-        close=("close", "last"),
-        volume=("volume", "sum"),
-    ).dropna()
-
-    return agg.reset_index()
+@dataclass
+class Signal:
+    direction: str  # "LONG" or "SHORT"
+    entry: float
+    sl: float
+    tp1: float
+    tp2: Optional[float] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
 
 
-def market_state_from_adx(adx_h1: float) -> str:
-    return "TRENDING" if adx_h1 >= 20 else "RANGING"
+# ---------------------------
+# Sessions
+# ---------------------------
+def active_session(now_utc: dt.datetime, *, enable_asia: bool, trade_weekends: bool) -> Optional[str]:
+    """
+    Returns: "ASIA", "LONDON_NY", or None
+    """
+    if not trade_weekends and now_utc.weekday() >= 5:
+        return None
+
+    h = now_utc.hour
+
+    if enable_asia and (0 <= h < 2):
+        return "ASIA"
+
+    if 7 <= h < 20:
+        return "LONDON_NY"
+
+    return None
 
 
-def trend_strength_from_adx(adx_h1: float) -> str:
-    if adx_h1 >= 35:
-        return "Very Strong"
-    if adx_h1 >= 25:
-        return "Strong"
-    if adx_h1 >= 20:
-        return "Moderate"
-    if adx_h1 >= 15:
-        return "Weak"
-    return "Very Weak"
+# ---------------------------
+# Trend detection
+# ---------------------------
+def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
+    """
+    H1 trend: EMA(50) vs EMA(200) + price location.
+    Returns "LONG"/"SHORT"/None
+    """
+    if len(h1_df) < 220:
+        return None
+
+    close = h1_df["close"]
+    ema50 = indicators.ema(close, 50)
+    ema200 = indicators.ema(close, 200)
+
+    if ema50.iloc[-1] > ema200.iloc[-1] and close.iloc[-1] > ema50.iloc[-1]:
+        return "LONG"
+    if ema50.iloc[-1] < ema200.iloc[-1] and close.iloc[-1] < ema50.iloc[-1]:
+        return "SHORT"
+    return None
 
 
-def in_cooldown(now_utc: dt.datetime, last_signal_time: Optional[dt.datetime], cooldown_minutes: int) -> bool:
-    if not last_signal_time:
+def m15_structure_ok(m15_df: pd.DataFrame, trend_dir: str) -> bool:
+    """
+    M15 structure filter:
+      - EMA(20) slope in direction
+      - Close above EMA(20) for LONG, below for SHORT
+    """
+    if len(m15_df) < 60:
         return False
-    return (now_utc - last_signal_time).total_seconds() < (cooldown_minutes * 60)
+
+    close = m15_df["close"]
+    ema20 = indicators.ema(close, 20)
+
+    slope = ema20.iloc[-1] - ema20.iloc[-5]  # rough slope
+    if trend_dir == "LONG":
+        return slope > 0 and close.iloc[-1] >= ema20.iloc[-1]
+    else:
+        return slope < 0 and close.iloc[-1] <= ema20.iloc[-1]
 
 
-def cooldown_minutes_for_regime(adx_h1: float, default_minutes: int) -> int:
-    # PATCH: regime-based cooldown
-    if adx_h1 >= 35:
-        return 20
-    if adx_h1 >= 25:
-        return 12
-    if adx_h1 >= 20:
-        return 10
-    return default_minutes
+# ---------------------------
+# Setup logic
+# ---------------------------
+def score_entry_gate(
+    *,
+    m5_df: pd.DataFrame,
+    m15_df: pd.DataFrame,
+    trend_dir: str,
+    session: str,
+) -> tuple[int, Dict[str, Any]]:
+    """
+    Score-based gate: returns (score, debug_details).
+    """
+    close = m5_df["close"]
+    high = m5_df["high"]
+    low = m5_df["low"]
 
+    upper, mid, lower = indicators.bollinger(close, 20, 2.0)
+    rsi = indicators.rsi(close, 14)
+    k, d = indicators.stoch_kd(high, low, close, 14, 3, 3)
+    adx_v, plus_di, minus_di = indicators.adx(high, low, close, 14)
 
-def main():
-    settings = load_settings()
+    score = 0
+    dbg: Dict[str, Any] = {}
 
-    symbol_td = settings.xau_symbol_td
-    symbol_label = "XAUUSD"
+    # 1) trend alignment (+2)
+    score += 2
+    dbg["trend_align"] = True
 
-    telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id)
+    # 2) M15 structure (+2)
+    m15_ok = m15_structure_ok(m15_df, trend_dir)
+    if m15_ok:
+        score += 2
+    dbg["m15_ok"] = m15_ok
 
-    logger.info("Starting XAUUSD bot (H1 primary, M15 fallback) + score gate + impulse continuation + liquidity filter.")
+    # 3) BB location (+1)
+    last_close = float(close.iloc[-1])
+    last_mid = float(mid.iloc[-1])
+    last_upper = float(upper.iloc[-1])
+    last_lower = float(lower.iloc[-1])
 
-    last_fetch_ts: float = 0.0
-    cached_m5: Optional[pd.DataFrame] = None
-
-    last_closed_m5_time: Optional[pd.Timestamp] = None
-    last_signal_time: Optional[dt.datetime] = None
-    last_signal_dir: Optional[str] = None
-
-    while True:
-        now_utc = dt.datetime.now(dt.timezone.utc)
-
-        # ------------------------------------------------------------------
-        # PATCH #1: Hard trading window enforcement (prevents night signals)
-        # ------------------------------------------------------------------
-        if not (settings.hard_session_start_hour_utc <= now_utc.hour < settings.hard_session_end_hour_utc):
-            logger.info("Outside HARD window %02d:00-%02d:00 UTC. Sleeping %ss...",
-                        settings.hard_session_start_hour_utc, settings.hard_session_end_hour_utc, settings.sleep_seconds)
-            time.sleep(settings.sleep_seconds)
-            continue
-
-        # ------------------------------------------------------------------
-        # PATCH #2: Session helper (kept) + weekend filter
-        # ------------------------------------------------------------------
-        if not is_within_sessions(
-            now_utc=now_utc,
-            session_1_start=settings.session_1_start,
-            session_1_end=settings.session_1_end,
-            session_2_start=None,
-            session_2_end=None,
-            trade_weekends=settings.trade_weekends,
-        ):
-            logger.info("Outside session/weekend filter. Sleeping %ss...", settings.sleep_seconds)
-            time.sleep(settings.sleep_seconds)
-            continue
-
-        # fetch / cache
-        need_fetch = (time.time() - last_fetch_ts) >= settings.fetch_interval_seconds or cached_m5 is None
-        if need_fetch:
-            logger.info("Fetching fresh M5 OHLCV data from Twelve Data...")
-            cached_m5 = fetch_m5_ohlcv_twelvedata(symbol=symbol_td, api_key=settings.twelvedata_api_key)
-            last_fetch_ts = time.time()
+    if trend_dir == "LONG":
+        # prefer pullback near mid/lower
+        if last_close <= last_mid:
+            score += 1
+            dbg["bb_pullback_ok"] = True
         else:
-            logger.info("Using cached M5 OHLCV data.")
-
-        if cached_m5 is None or len(cached_m5) < 300:
-            logger.warning("Not enough M5 data yet. Sleeping %ss...", settings.sleep_seconds)
-            time.sleep(settings.sleep_seconds)
-            continue
-
-        # Only evaluate on new CLOSED candle
-        current_last_time = cached_m5["datetime"].iloc[-1]
-        if last_closed_m5_time is not None and current_last_time == last_closed_m5_time:
-            logger.info("No new M5 candle closed yet (last=%s). Sleeping %ss...", last_closed_m5_time, settings.sleep_seconds)
-            time.sleep(settings.sleep_seconds)
-            continue
-
-        last_closed_m5_time = current_last_time
-        logger.info("New M5 candle detected: %s — evaluating signal...", last_closed_m5_time)
-
-        # resample
-        m15_df = resample_ohlc(cached_m5, "15min")
-        h1_df = resample_ohlc(cached_m5, "1h")
-
-        if len(h1_df) < 60 or len(m15_df) < 60:
-            logger.info("Not enough data after resampling, sleeping %ss...", settings.sleep_seconds)
-            time.sleep(settings.sleep_seconds)
-            continue
-
-        # ADX(H1)
-        adx_h1_series, _, _ = indicators.adx(h1_df["high"], h1_df["low"], h1_df["close"], period=14)
-        adx_h1 = float(adx_h1_series.iloc[-1]) if pd.notna(adx_h1_series.iloc[-1]) else 0.0
-
-        # trend detection
-        h1_trend = detect_trend_h1(h1_df)
-        trend_source = "H1"
-
-        if h1_trend is None:
-            m15_dir = detect_trend_m15_direction(m15_df)
-            if m15_dir is None:
-                logger.info("No clear H1 trend and no clear M15 direction, skipping.")
-                time.sleep(settings.sleep_seconds)
-                continue
-            trend_dir = m15_dir
-            trend_source = "M15"
+            dbg["bb_pullback_ok"] = False
+    else:
+        if last_close >= last_mid:
+            score += 1
+            dbg["bb_pullback_ok"] = True
         else:
-            trend_dir = h1_trend
-            _ = confirm_trend_m15(m15_df, trend_dir)
+            dbg["bb_pullback_ok"] = False
 
-        # news
-        try:
-            high_news = has_high_impact_news_near(symbol_label, now_utc, window_minutes=settings.news_window_minutes)
-        except Exception:
-            high_news = False
+    # 4) stochastic confirmation (+1)
+    k0, d0 = float(k.iloc[-1]), float(d.iloc[-1])
+    k1, d1 = float(k.iloc[-2]), float(d.iloc[-2])
+    stoch_cross_up = (k1 < d1) and (k0 > d0)
+    stoch_cross_down = (k1 > d1) and (k0 < d0)
 
-        # ------------------------------------------------------------------
-        # PATCH #3: Regime-based cooldown (stops over-firing)
-        # ------------------------------------------------------------------
-        cooldown_minutes = (
-            cooldown_minutes_for_regime(adx_h1, settings.cooldown_minutes_default)
-            if settings.use_regime_based_cooldown
-            else settings.cooldown_minutes_default
-        )
+    if trend_dir == "LONG" and stoch_cross_up:
+        score += 1
+        dbg["stoch_confirm"] = "cross_up"
+    elif trend_dir == "SHORT" and stoch_cross_down:
+        score += 1
+        dbg["stoch_confirm"] = "cross_down"
+    else:
+        dbg["stoch_confirm"] = "none"
 
-        if in_cooldown(now_utc, last_signal_time, cooldown_minutes):
-            if settings.cooldown_same_direction_only and last_signal_dir and last_signal_dir != trend_dir:
-                pass
-            else:
-                logger.info("Cooldown active (%sm). Skipping this candle.", cooldown_minutes)
-                time.sleep(settings.sleep_seconds)
-                continue
+    # 5) candle confirmation (+1)
+    o = float(m5_df["open"].iloc[-1])
+    c = float(m5_df["close"].iloc[-1])
+    bullish = c > o
+    bearish = c < o
+    if trend_dir == "LONG" and bullish:
+        score += 1
+        dbg["candle_confirm"] = "bull"
+    elif trend_dir == "SHORT" and bearish:
+        score += 1
+        dbg["candle_confirm"] = "bear"
+    else:
+        dbg["candle_confirm"] = "none"
 
-        # trigger with score gate + liquidity filter + impulse continuation
-        signal = trigger_signal_m5(
-            m5_df=cached_m5,
-            trend_dir=trend_dir,
-            m15_df=m15_df,
-            h1_df=h1_df,
-            high_news=high_news,
-            min_score=settings.min_entry_score,
-            range_filter_lookback=settings.range_filter_lookback,
-            range_filter_min_ratio=settings.range_filter_min_ratio,
-        )
+    # 6) avoid extreme RSI in ASIA (stricter) (-1 penalty)
+    r = float(rsi.iloc[-1])
+    if session == "ASIA":
+        if trend_dir == "LONG" and r > 70:
+            score -= 1
+            dbg["asia_rsi_penalty"] = True
+        elif trend_dir == "SHORT" and r < 30:
+            score -= 1
+            dbg["asia_rsi_penalty"] = True
+        else:
+            dbg["asia_rsi_penalty"] = False
 
-        if not signal:
-            logger.info("No M5 trigger signal on candle close, sleeping %ss.", settings.sleep_seconds)
-            time.sleep(settings.sleep_seconds)
-            continue
+    dbg["rsi_m5"] = r
+    dbg["stoch_k_m5"] = k0
+    dbg["adx_m5"] = float(adx_v.iloc[-1])
+    dbg["bb_upper"] = last_upper
+    dbg["bb_mid"] = last_mid
+    dbg["bb_lower"] = last_lower
 
-        # regime + dynamic TP/SL
-        regime = market_regime(h1_df)
-        dynamic_tp_sl(signal, h1_df, regime)
-
-        # market classifiers
-        market_state = market_state_from_adx(adx_h1)
-        trend_strength = trend_strength_from_adx(adx_h1)
-
-        # confidence
-        setup_type = signal.extra.get("setup_type", "GENERIC")
-        adx_m5 = float(signal.extra.get("adx_m5", 0.0))
-        entry_score = int(signal.extra.get("entry_score", 0))
-
-        conf = compute_confidence(
-            trend_source=trend_source,
-            setup_type=setup_type,
-            adx_h1=adx_h1,
-            adx_m5=adx_m5,
-            high_news=high_news,
-            entry_score=entry_score,
-        )
-        conf_text = confidence_label(conf)
-
-        msg = build_signal_message(
-            symbol_label=symbol_label,
-            signal=signal,
-            trend_label=trend_dir,
-            trend_source=trend_source,
-            session_window=f"{settings.hard_session_start_hour_utc:02d}:00-{settings.hard_session_end_hour_utc:02d}:00",
-            high_news=high_news,
-            market_state=market_state,
-            market_regime_text=regime,
-            adx_h1=adx_h1,
-            trend_strength=trend_strength,
-            confidence_score=conf,
-            confidence_text=conf_text,
-        )
-
-        telegram.send_message(msg)
-        last_signal_time = now_utc
-        last_signal_dir = signal.direction
-
-        logger.info(
-            "Signal sent. source=%s dir=%s setup=%s score=%s conf=%s (%s)",
-            trend_source, trend_dir, setup_type, entry_score, conf, conf_text
-        )
-
-        time.sleep(settings.sleep_seconds)
+    return score, dbg
 
 
-if __name__ == "__main__":
-    main()
+def make_sl_tp_from_rr(entry: float, sl: float, direction: str, rr: float) -> float:
+    risk = abs(entry - sl)
+    if risk <= 0:
+        risk = 0.01
+    if direction == "LONG":
+        return entry + risk * rr
+    return entry - risk * rr
+
+
+def trigger_signal_m5(
+    *,
+    m5_df: pd.DataFrame,
+    m15_df: pd.DataFrame,
+    h1_df: pd.DataFrame,
+    trend_dir: str,
+    high_news: bool,
+    min_score: int,
+    session: str,
+    asia_extra_buffer: int,
+    tp1_rr: float,
+    tp2_rr: float,
+    asia_tp1_rr: float,
+    sl_atr_mult: float,
+) -> Optional[Signal]:
+    """
+    Produces pullback-based signals only (no continuation in ASIA).
+    """
+    if high_news:
+        return None
+
+    # ASIA rule: pullback only, stricter scoring
+    required = min_score + (asia_extra_buffer if session == "ASIA" else 0)
+
+    score, dbg = score_entry_gate(m5_df=m5_df, m15_df=m15_df, trend_dir=trend_dir, session=session)
+
+    if score < required:
+        return None
+
+    # Build SL using ATR(H1) * mult
+    atr_h1 = float(indicators.atr(h1_df["high"], h1_df["low"], h1_df["close"], 14).iloc[-1])
+    if atr_h1 <= 0:
+        atr_h1 = 5.0
+
+    entry = float(m5_df["close"].iloc[-1])
+    direction = trend_dir
+
+    if direction == "LONG":
+        sl = entry - atr_h1 * sl_atr_mult
+    else:
+        sl = entry + atr_h1 * sl_atr_mult
+
+    # TP logic
+    if session == "ASIA":
+        tp1 = make_sl_tp_from_rr(entry, sl, direction, asia_tp1_rr)
+        tp2 = None
+        tp_mode = "TP1_ONLY"
+    else:
+        tp1 = make_sl_tp_from_rr(entry, sl, direction, tp1_rr)
+        tp2 = make_sl_tp_from_rr(entry, sl, direction, tp2_rr)
+        tp_mode = "TP1_TP2"
+
+    sig = Signal(
+        direction=direction,
+        entry=entry,
+        sl=sl,
+        tp1=tp1,
+        tp2=tp2,
+        extra={
+            "setup_type": f"PULLBACK_{direction}",
+            "entry_score": int(score),
+            "session": session,
+            "tp_mode": tp_mode,
+            **dbg,
+        },
+    )
+    return sig
