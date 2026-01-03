@@ -104,7 +104,6 @@ def load_settings() -> Settings:
         enable_momentum_override=os.getenv("ENABLE_MOMENTUM_OVERRIDE", "true").lower() in ("1", "true", "yes"),
         momentum_override_adx_m5=float(os.getenv("MOMENTUM_OVERRIDE_ADX_M5", "35.0")),
     )# config.py
-from __future__ import annotations
 
 from dataclasses import dataclass
 import os
