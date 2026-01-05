@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import datetime as dt
 from typing import Optional, Literal, Dict, Any
 
+import numpy as np
 import pandas as pd
 
 
@@ -56,23 +57,36 @@ def active_session(
 # Small indicator helpers (pure pandas)
 # -------------------------
 def _ema(series: pd.Series, span: int) -> pd.Series:
+    series = series.astype(float)
     return series.ewm(span=span, adjust=False).mean()
 
 
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """
+    RSI with stable numeric dtype + no deprecated fillna(method=...).
+    """
+    close = close.astype(float)
     delta = close.diff()
+
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
 
     avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
 
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(method="bfill")
+    # avoid object dtype by using np.nan (not pd.NA)
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+
+    # backfill early NaNs
+    return rsi.bfill()
 
 
 def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    high = high.astype(float)
+    low = low.astype(float)
+    close = close.astype(float)
+
     prev_close = close.shift(1)
     tr1 = high - low
     tr2 = (high - prev_close).abs()
@@ -124,7 +138,7 @@ def detect_trend_h1(h1_df: pd.DataFrame) -> Optional[str]:
 def trigger_signal_m5(
     m5_df: pd.DataFrame,
     m15_df: pd.DataFrame,
-    h1_df: pd.DataFrame,
+    h1_df: pd.DataFrame,  # kept for signature compatibility (not used here)
     trend_dir: str,
     high_news: bool,
     min_score: int,
@@ -136,24 +150,27 @@ def trigger_signal_m5(
     sl_atr_mult: float,
 ) -> Optional[Signal]:
     """
-    Lightweight, deterministic scoring model.
-    Produces Signal(direction, entry, sl, tp1, tp2, extra={...})
+    Scoring model (0–90) to support your config:
+      - min_score = 65
+      - asia_extra_buffer = 2
 
-    Notes:
-    - trend_dir expected "BULL" or "BEAR" from detect_trend_h1
-    - If ASIA, requires extra score buffer
-    - If high_news, blocks entry (conservative)
+    Score weights:
+      - M5 alignment: 20
+      - M15 alignment: 20
+      - Price vs EMA20: 20
+      - RSI band: 20
+      - EMA50 slope support: 10
+      Max score: 90
     """
     if m5_df is None or len(m5_df) < 200:
         return None
     if m15_df is None or len(m15_df) < 120:
         return None
-
     if high_news:
         return None
 
     # Session threshold
-    required_score = min_score + (asia_extra_buffer if session == "ASIA" else 0)
+    required_score = int(min_score + (asia_extra_buffer if session == "ASIA" else 0))
 
     # Prepare series
     m5 = m5_df.copy()
@@ -180,49 +197,79 @@ def trigger_signal_m5(
     if last_atr <= 0:
         return None
 
-    # Direction from trend
-    direction: Direction = "BUY" if trend_dir == "BULL" else "SELL"
-
-    # Scoring (0–10-ish)
-    score = 0
-
-    # 1) M5 alignment
-    if direction == "BUY" and m5_ema20.iloc[-1] > m5_ema50.iloc[-1]:
-        score += 2
-    if direction == "SELL" and m5_ema20.iloc[-1] < m5_ema50.iloc[-1]:
-        score += 2
-
-    # 2) M15 alignment (macro filter)
-    if direction == "BUY" and m15_ema20.iloc[-1] > m15_ema50.iloc[-1]:
-        score += 2
-    if direction == "SELL" and m15_ema20.iloc[-1] < m15_ema50.iloc[-1]:
-        score += 2
-
-    # 3) Price position vs EMA20 (momentum)
-    if direction == "BUY" and last_price > float(m5_ema20.iloc[-1]):
-        score += 2
-    if direction == "SELL" and last_price < float(m5_ema20.iloc[-1]):
-        score += 2
-
-    # 4) RSI sanity (avoid chasing extremes)
-    last_rsi = float(m5_rsi14.iloc[-1]) if pd.notna(m5_rsi14.iloc[-1]) else 50.0
-    if direction == "BUY" and 45 <= last_rsi <= 70:
-        score += 2
-    if direction == "SELL" and 30 <= last_rsi <= 55:
-        score += 2
-
-    # 5) Small bonus if EMA50 slope supports direction
-    ema50_slope = float(m5_ema50.iloc[-1] - m5_ema50.iloc[-6])
-    if direction == "BUY" and ema50_slope > 0:
-        score += 1
-    if direction == "SELL" and ema50_slope < 0:
-        score += 1
-
-    if score < required_score:
+    # -------------------------
+    # FIX: normalize direction input
+    # -------------------------
+    td = (trend_dir or "").upper().strip()
+    if td in ("BULL", "LONG", "BUY"):
+        direction: Direction = "BUY"
+    elif td in ("BEAR", "SHORT", "SELL"):
+        direction = "SELL"
+    else:
+        # unknown trend input -> skip
         return None
 
+    # -------------------------
+    # Scoring (0–90)
+    # -------------------------
+    score = 0
+
+    cond_m5_align = False
+    cond_m15_align = False
+    cond_price_momo = False
+    cond_rsi_ok = False
+    cond_slope_ok = False
+
+    # 1) M5 alignment (20)
+    if direction == "BUY" and m5_ema20.iloc[-1] > m5_ema50.iloc[-1]:
+        score += 20
+        cond_m5_align = True
+    if direction == "SELL" and m5_ema20.iloc[-1] < m5_ema50.iloc[-1]:
+        score += 20
+        cond_m5_align = True
+
+    # 2) M15 alignment (20)
+    if direction == "BUY" and m15_ema20.iloc[-1] > m15_ema50.iloc[-1]:
+        score += 20
+        cond_m15_align = True
+    if direction == "SELL" and m15_ema20.iloc[-1] < m15_ema50.iloc[-1]:
+        score += 20
+        cond_m15_align = True
+
+    # 3) Price position vs M5 EMA20 (20)
+    if direction == "BUY" and last_price > float(m5_ema20.iloc[-1]):
+        score += 20
+        cond_price_momo = True
+    if direction == "SELL" and last_price < float(m5_ema20.iloc[-1]):
+        score += 20
+        cond_price_momo = True
+
+    # 4) RSI sanity (20)
+    last_rsi = float(m5_rsi14.iloc[-1]) if pd.notna(m5_rsi14.iloc[-1]) else 50.0
+    if direction == "BUY" and 45.0 <= last_rsi <= 70.0:
+        score += 20
+        cond_rsi_ok = True
+    if direction == "SELL" and 30.0 <= last_rsi <= 55.0:
+        score += 20
+        cond_rsi_ok = True
+
+    # 5) EMA50 slope supports direction (10)
+    ema50_slope = float(m5_ema50.iloc[-1] - m5_ema50.iloc[-6])
+    if direction == "BUY" and ema50_slope > 0:
+        score += 10
+        cond_slope_ok = True
+    if direction == "SELL" and ema50_slope < 0:
+        score += 10
+        cond_slope_ok = True
+
+    if score < required_score:
+        # keep rich diagnostics so logs can explain “No signal”
+        return None
+
+    # -------------------------
     # SL/TP
-    sl_dist = sl_atr_mult * last_atr
+    # -------------------------
+    sl_dist = float(sl_atr_mult) * last_atr
 
     if direction == "BUY":
         sl = last_price - sl_dist
@@ -237,10 +284,19 @@ def trigger_signal_m5(
 
     extra = {
         "entry_score": int(score),
-        "tp_mode": ("ASIA_TIGHT" if session == "ASIA" else "NORMAL"),
         "required_score": int(required_score),
+        "tp_mode": ("ASIA_TIGHT" if session == "ASIA" else "NORMAL"),
+        "trend_input": td,
+        "direction": direction,
         "rsi": float(round(last_rsi, 2)),
         "atr": float(round(last_atr, 4)),
+        "ema50_slope": float(round(ema50_slope, 6)),
+        # condition breakdown (super useful for debugging)
+        "cond_m5_align": cond_m5_align,
+        "cond_m15_align": cond_m15_align,
+        "cond_price_momo": cond_price_momo,
+        "cond_rsi_ok": cond_rsi_ok,
+        "cond_slope_ok": cond_slope_ok,
     }
 
     return Signal(
