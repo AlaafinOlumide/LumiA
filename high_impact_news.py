@@ -8,40 +8,31 @@ from typing import Optional, Tuple
 import requests
 
 
-def _now_utc() -> datetime:
+def _default_now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def is_high_impact_now(
     *,
+    now_utc: Optional[datetime] = None,   # ✅ ADD THIS
     minutes_before: int = 10,
     minutes_after: int = 10,
     currencies: Tuple[str, ...] = ("USD", "EUR", "GBP"),
 ) -> bool:
     """
-    Returns True if we are within a 'high impact news' window.
-
-    Default: blocks trading 10 minutes before and after high-impact events
-    on USD/EUR/GBP.
-
-    Requires env:
-      - FMP_API_KEY (Financial Modeling Prep economic calendar)
-        OR set HIGH_IMPACT_NEWS=0 to disable this feature safely.
+    Returns True if current time is within high impact news window.
     """
-    # Allow hard-disable without breaking bot
-    if os.getenv("HIGH_IMPACT_NEWS", "1").strip() in ("0", "false", "False", "no", "NO"):
+
+    if os.getenv("HIGH_IMPACT_NEWS", "1").strip().lower() in ("0", "false", "no"):
         return False
 
     api_key = os.getenv("FMP_API_KEY")
     if not api_key:
-        # If no key, don't crash the bot. Just assume "no news block".
-        # (If you prefer stricter safety: return True instead.)
         return False
 
-    # FMP economic calendar endpoint
-    # We'll request today's and tomorrow's events to catch late/early UTC overlaps.
+    now = (now_utc or _default_now_utc()).astimezone(timezone.utc)
+
     base_url = "https://financialmodelingprep.com/api/v3/economic_calendar"
-    now = _now_utc()
     start = (now - timedelta(days=1)).date().isoformat()
     end = (now + timedelta(days=1)).date().isoformat()
 
@@ -54,27 +45,21 @@ def is_high_impact_now(
         r.raise_for_status()
         events = r.json() if isinstance(r.json(), list) else []
     except Exception:
-        # Never crash trading because calendar fetch failed
         return False
-
-    # Define what counts as "high impact"
-    high_impact_keywords = ("high",)  # many calendars use "High" impact label
 
     window_start = now - timedelta(minutes=minutes_before)
     window_end = now + timedelta(minutes=minutes_after)
 
     for ev in events:
-        # Currency filter
         cur = (ev.get("country") or ev.get("currency") or "").upper()
         if cur and cur not in currencies:
             continue
 
-        # Impact filter (varies by API)
         impact = str(ev.get("impact") or ev.get("importance") or "").lower()
-        if impact and not any(k in impact for k in high_impact_keywords):
+        # keep simple: treat "high" as high impact
+        if impact and "high" not in impact:
             continue
 
-        # Parse datetime (FMP often uses "date" as 'YYYY-MM-DD HH:MM:SS')
         dt_str = ev.get("date")
         if not dt_str:
             continue
@@ -90,10 +75,6 @@ def is_high_impact_now(
 
 
 def _parse_event_dt(dt_str: str) -> Optional[datetime]:
-    """
-    Best-effort parsing for economic calendar datetime strings.
-    Assumes UTC if timezone missing.
-    """
     dt_str = dt_str.strip()
     fmts = (
         "%Y-%m-%d %H:%M:%S",
