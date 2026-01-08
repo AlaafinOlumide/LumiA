@@ -1,90 +1,113 @@
 # high_impact_news.py
-# (kept your implementation; only export the name main.py uses)
-import datetime as dt
-import logging
-from typing import Any, Dict, List
+from __future__ import annotations
+
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple
+
 import requests
 
-logger = logging.getLogger(__name__)
-FF_JSON_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-RELEVANT_CURRENCIES = {"USD", "ALL", ""}
 
-_CACHE: Dict[str, Any] = {"last_fetch": None, "events": []}
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-def _fetch_calendar_events() -> List[Dict[str, Any]]:
-    global _CACHE
-    now = dt.datetime.utcnow()
-    last_fetch = _CACHE.get("last_fetch")
-    if last_fetch and (now - last_fetch).total_seconds() < 300:
-        return _CACHE.get("events", [])
 
-    try:
-        resp = requests.get(FF_JSON_URL, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.warning("Failed to fetch ForexFactory calendar JSON: %s", e)
-        return _CACHE.get("events", [])
+def is_high_impact_now(
+    *,
+    minutes_before: int = 10,
+    minutes_after: int = 10,
+    currencies: Tuple[str, ...] = ("USD", "EUR", "GBP"),
+) -> bool:
+    """
+    Returns True if we are within a 'high impact news' window.
 
-    if isinstance(data, list):
-        events = data
-    elif isinstance(data, dict):
-        events = data.get("events") or data.get("calendar") or []
-        if not events:
-            possible: List[Dict[str, Any]] = []
-            for v in data.values():
-                if isinstance(v, list):
-                    possible.extend(v)
-            events = possible
-    else:
-        events = []
+    Default: blocks trading 10 minutes before and after high-impact events
+    on USD/EUR/GBP.
 
-    _CACHE["last_fetch"] = now
-    _CACHE["events"] = events
-    return events
-
-def _event_matches_xauusd(ev: Dict[str, Any]) -> bool:
-    currency = str(ev.get("currency", "") or ev.get("country", "") or "").upper()
-    if currency not in RELEVANT_CURRENCIES:
+    Requires env:
+      - FMP_API_KEY (Financial Modeling Prep economic calendar)
+        OR set HIGH_IMPACT_NEWS=0 to disable this feature safely.
+    """
+    # Allow hard-disable without breaking bot
+    if os.getenv("HIGH_IMPACT_NEWS", "1").strip() in ("0", "false", "False", "no", "NO"):
         return False
-    impact = str(ev.get("impact", "")).lower()
-    return "high" in impact
 
-def _event_time(ev: Dict[str, Any]):
-    ts = ev.get("timestamp") or ev.get("time") or ev.get("date")
-    if ts is None:
-        return None
+    api_key = os.getenv("FMP_API_KEY")
+    if not api_key:
+        # If no key, don't crash the bot. Just assume "no news block".
+        # (If you prefer stricter safety: return True instead.)
+        return False
+
+    # FMP economic calendar endpoint
+    # We'll request today's and tomorrow's events to catch late/early UTC overlaps.
+    base_url = "https://financialmodelingprep.com/api/v3/economic_calendar"
+    now = _now_utc()
+    start = (now - timedelta(days=1)).date().isoformat()
+    end = (now + timedelta(days=1)).date().isoformat()
+
     try:
-        if isinstance(ts, (int, float)):
-            return dt.datetime.utcfromtimestamp(int(ts))
-        return dt.datetime.utcfromtimestamp(int(str(ts)))
+        r = requests.get(
+            base_url,
+            params={"from": start, "to": end, "apikey": api_key},
+            timeout=20,
+        )
+        r.raise_for_status()
+        events = r.json() if isinstance(r.json(), list) else []
     except Exception:
-        try:
-            return dt.datetime.fromisoformat(str(ts))
-        except Exception:
-            return None
-
-def has_high_impact_news_near(symbol: str, now_utc: dt.datetime, window_minutes: int = 60) -> bool:
-    try:
-        events = _fetch_calendar_events()
-    except Exception as e:
-        logger.warning("Error while fetching calendar events: %s", e)
+        # Never crash trading because calendar fetch failed
         return False
 
-    if not events:
-        return False
+    # Define what counts as "high impact"
+    high_impact_keywords = ("high",)  # many calendars use "High" impact label
 
-    now_ts = int(now_utc.timestamp())
-    window = window_minutes * 60
+    window_start = now - timedelta(minutes=minutes_before)
+    window_end = now + timedelta(minutes=minutes_after)
 
     for ev in events:
-        if not isinstance(ev, dict):
+        # Currency filter
+        cur = (ev.get("country") or ev.get("currency") or "").upper()
+        if cur and cur not in currencies:
             continue
-        if not _event_matches_xauusd(ev):
+
+        # Impact filter (varies by API)
+        impact = str(ev.get("impact") or ev.get("importance") or "").lower()
+        if impact and not any(k in impact for k in high_impact_keywords):
             continue
-        t = _event_time(ev)
-        if t is None:
+
+        # Parse datetime (FMP often uses "date" as 'YYYY-MM-DD HH:MM:SS')
+        dt_str = ev.get("date")
+        if not dt_str:
             continue
-        if abs(int(t.timestamp()) - now_ts) <= window:
+
+        ev_dt = _parse_event_dt(dt_str)
+        if not ev_dt:
+            continue
+
+        if window_start <= ev_dt <= window_end:
             return True
+
     return False
+
+
+def _parse_event_dt(dt_str: str) -> Optional[datetime]:
+    """
+    Best-effort parsing for economic calendar datetime strings.
+    Assumes UTC if timezone missing.
+    """
+    dt_str = dt_str.strip()
+    fmts = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    )
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(dt_str, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    return None
