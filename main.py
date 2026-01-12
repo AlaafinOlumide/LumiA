@@ -63,6 +63,17 @@ def _utc_now() -> dt.datetime:
 
 
 # -------------------------
+# Time helpers (rate-limit API calls)
+# -------------------------
+def _seconds_until_next_bar(now_utc: dt.datetime, minutes: int, buffer_sec: int = 2) -> int:
+    """Sleep until just after the next bar closes (UTC)."""
+    epoch = int(now_utc.timestamp())
+    interval = minutes * 60
+    next_close = ((epoch // interval) + 1) * interval
+    return max(1, (next_close - epoch) + buffer_sec)
+
+
+# -------------------------
 # DataFrame time handling
 # -------------------------
 def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -176,27 +187,34 @@ def _momentum_override_trend(m5_df: pd.DataFrame) -> Tuple[Optional[str], float]
 
 
 # -------------------------
-# News wrapper (fix your error)
+# News wrapper (supports multiple signatures)
 # -------------------------
 def _safe_news_check(now_utc: dt.datetime, block_on_unknown_news: bool) -> bool:
     """
-    Your repo's is_high_impact_now() currently takes NO args.
-    This wrapper supports both:
+    Supports:
       - is_high_impact_now()
       - is_high_impact_now(now_utc)
       - is_high_impact_now(now_utc=...)
     """
     try:
         try:
-            return bool(is_high_impact_now(now_utc=now_utc))  # if supported
+            return bool(is_high_impact_now(now_utc=now_utc))
         except TypeError:
             try:
-                return bool(is_high_impact_now(now_utc))      # if supported positionally
+                return bool(is_high_impact_now(now_utc))
             except TypeError:
-                return bool(is_high_impact_now())             # ✅ your current case
+                return bool(is_high_impact_now())
     except Exception as e:
         logger.warning("News check failed (%s).", e)
         return True if block_on_unknown_news else False
+
+
+# -------------------------
+# TwelveData backoff helper
+# -------------------------
+def _looks_like_rate_limit(err: Exception) -> bool:
+    s = str(err).lower()
+    return ("429" in s) or ("too many requests" in s) or ("rate limit" in s) or ("limit" in s and "twelve" in s)
 
 
 # -------------------------
@@ -208,12 +226,14 @@ def main() -> None:
     symbol = os.getenv("SYMBOL", "XAU/USD")
     symbol_label = os.getenv("SYMBOL_LABEL", "XAUUSD")
 
-    outputsize = _env_int("OUTPUTSIZE", 2000)
-    fetch_interval = _env_int("FETCH_INTERVAL_SEC", 180)
-    sleep_seconds = _env_int("SLEEP_SECONDS", 60)
-    ignore_latest_candle = _env_bool("IGNORE_LATEST_CANDLE", True)
+    # ✅ Reduce default outputsize (big savings on free tier)
+    outputsize = _env_int("OUTPUTSIZE", 600)
 
-    # Sessions (match your logs)
+    # ✅ Sleep to candle close instead of looping every 60s
+    ignore_latest_candle = _env_bool("IGNORE_LATEST_CANDLE", True)
+    bar_close_buffer_sec = _env_int("BAR_CLOSE_BUFFER_SEC", 2)
+
+    # Sessions
     enable_asia = _env_bool("ENABLE_ASIA", True)
     trade_weekends = _env_bool("TRADE_WEEKENDS", False)
     asia_start = _env_int("ASIA_START_UTC", 0)
@@ -234,7 +254,15 @@ def main() -> None:
     asia_tp1_rr = _env_float("ASIA_TP1_RR", 0.9)
     sl_atr_mult = _env_float("SL_ATR_MULT", 1.5)
 
+    # News behavior
     block_on_unknown_news = _env_bool("BLOCK_ON_UNKNOWN_NEWS", False)
+
+    # ✅ Anti-spam protections
+    signal_cooldown_sec = _env_int("SIGNAL_COOLDOWN_SEC", 30 * 60)  # default 30 min
+    one_signal_per_candle = _env_bool("ONE_SIGNAL_PER_CANDLE", True)
+
+    # ✅ Backoff when TwelveData rate-limits
+    rate_limit_backoff_sec = _env_int("RATE_LIMIT_BACKOFF_SEC", 30 * 60)  # 30 min
 
     logger.info("Starting XAUUSD bot on Render/local.")
     logger.info(
@@ -242,22 +270,48 @@ def main() -> None:
         enable_asia, asia_start, asia_end, london_start, london_end, trade_weekends
     )
     logger.info(
-        "Data: outputsize=%s fetch_interval=%ss sleep=%ss ignore_latest_candle=%s",
-        outputsize, fetch_interval, sleep_seconds, ignore_latest_candle
+        "Data: outputsize=%s ignore_latest_candle=%s | scheduler=sleep_to_next_M5_close",
+        outputsize, ignore_latest_candle
     )
     logger.info(
         "Gates: min_score=%s asia_buffer=%s momentum_override=%s (ADX_M5>=%.1f)",
         min_entry_score, asia_extra_score_buffer, enable_momentum_override, adx_override_threshold
     )
+    logger.info(
+        "Protections: cooldown=%ss one_signal_per_candle=%s backoff_on_429=%ss",
+        signal_cooldown_sec, one_signal_per_candle, rate_limit_backoff_sec
+    )
 
     cached_m5: Optional[pd.DataFrame] = None
     cached_m15: Optional[pd.DataFrame] = None
     cached_h1: Optional[pd.DataFrame] = None
-    last_fetch_ts = 0.0
+
+    # ✅ Stagger refresh by timeframe
+    last_m5_fetch = 0.0
+    last_m15_fetch = 0.0
+    last_h1_fetch = 0.0
+
+    M5_REFRESH = 5 * 60
+    M15_REFRESH = 15 * 60
+    H1_REFRESH = 60 * 60
+
+    # Candle + signal tracking
     last_eval_candle_time: Optional[pd.Timestamp] = None
+    last_signal_candle_time: Optional[pd.Timestamp] = None
+    last_signal_sent_ts = 0.0
+
+    # Backoff state for rate limits
+    api_backoff_until = 0.0
 
     while True:
         now_utc = _utc_now()
+
+        # If we are in API backoff, sleep until backoff ends (or next minute)
+        if time.time() < api_backoff_until:
+            sleep_for = max(5, int(api_backoff_until - time.time()))
+            logger.warning("In TwelveData backoff. Sleeping %ss...", sleep_for)
+            time.sleep(sleep_for)
+            continue
 
         session = active_session(
             now_utc=now_utc,
@@ -270,49 +324,80 @@ def main() -> None:
         )
 
         if session is None:
-            logger.info("Outside trading sessions. Sleeping %ss...", sleep_seconds)
-            time.sleep(sleep_seconds)
+            # Outside session: sleep until next M5 close (cheap)
+            sleep_s = _seconds_until_next_bar(now_utc, minutes=5, buffer_sec=bar_close_buffer_sec)
+            logger.info("Outside trading sessions. Sleeping to next M5 close (%ss)...", sleep_s)
+            time.sleep(sleep_s)
             continue
 
-        do_refresh = (time.time() - last_fetch_ts) >= fetch_interval
+        # ✅ Sleep-driven scheduler: only evaluate right after M5 close
+        sleep_s = _seconds_until_next_bar(now_utc, minutes=5, buffer_sec=bar_close_buffer_sec)
+        logger.info("Waiting for next M5 close (%ss)...", sleep_s)
+        time.sleep(sleep_s)
 
+        now_utc = _utc_now()  # refresh time after sleep
+
+        # Fetch data with staggered refresh (massive request reduction)
         try:
-            if do_refresh or cached_m5 is None:
-                logger.info("Fetching fresh M5 OHLCV data from Twelve Data...")
+            now_ts = time.time()
+
+            if cached_m5 is None or (now_ts - last_m5_fetch) >= M5_REFRESH:
+                logger.info("Fetching M5 OHLCV from Twelve Data...")
                 cached_m5 = get_ohlcv_df(symbol=symbol, interval="5min", outputsize=outputsize)
-                last_fetch_ts = time.time()
+                last_m5_fetch = now_ts
             else:
                 logger.info("Using cached M5 OHLCV data.")
 
-            if do_refresh or cached_m15 is None:
+            if cached_m15 is None or (now_ts - last_m15_fetch) >= M15_REFRESH:
+                logger.info("Fetching M15 OHLCV from Twelve Data...")
                 cached_m15 = get_ohlcv_df(symbol=symbol, interval="15min", outputsize=outputsize)
-            if do_refresh or cached_h1 is None:
+                last_m15_fetch = now_ts
+            else:
+                logger.info("Using cached M15 OHLCV data.")
+
+            if cached_h1 is None or (now_ts - last_h1_fetch) >= H1_REFRESH:
+                logger.info("Fetching H1 OHLCV from Twelve Data...")
                 cached_h1 = get_ohlcv_df(symbol=symbol, interval="1h", outputsize=outputsize)
+                last_h1_fetch = now_ts
+            else:
+                logger.info("Using cached H1 OHLCV data.")
 
             m5_df = _ensure_utc_index(cached_m5)
             m15_df = _ensure_utc_index(cached_m15)
             h1_df = _ensure_utc_index(cached_h1)
 
         except Exception as e:
-            logger.exception("Data fetch failed: %s. Sleeping %ss...", e, sleep_seconds)
-            time.sleep(sleep_seconds)
+            if _looks_like_rate_limit(e):
+                api_backoff_until = time.time() + rate_limit_backoff_sec
+                logger.warning("Hit TwelveData limit / 429. Backing off for %ss. Error=%s", rate_limit_backoff_sec, e)
+            else:
+                logger.exception("Data fetch failed: %s", e)
             continue
 
         eval_candle_time = _last_closed_candle_time(m5_df, ignore_latest_candle=ignore_latest_candle)
         if eval_candle_time is None:
-            logger.info("Not enough M5 data to evaluate. Sleeping %ss...", sleep_seconds)
-            time.sleep(sleep_seconds)
+            logger.info("Not enough M5 data to evaluate. Skipping this cycle.")
             continue
 
         if last_eval_candle_time is not None and eval_candle_time <= last_eval_candle_time:
-            logger.info("No new CLOSED M5 candle yet (eval_time=%s). Sleeping %ss...", str(eval_candle_time), sleep_seconds)
-            time.sleep(sleep_seconds)
+            logger.info("No new CLOSED M5 candle yet (eval_time=%s).", str(eval_candle_time))
             continue
 
         last_eval_candle_time = eval_candle_time
         logger.info("New CLOSED M5 candle detected: %s — evaluating signal... session=%s", str(eval_candle_time), session)
 
-        # ✅ FIXED: news check call
+        # ✅ Prevent multiple signals on same candle
+        if one_signal_per_candle and (last_signal_candle_time is not None) and (eval_candle_time == last_signal_candle_time):
+            logger.info("Already sent a signal for this candle (%s). Skipping.", str(eval_candle_time))
+            continue
+
+        # ✅ Cooldown to stop signal spam
+        if (time.time() - last_signal_sent_ts) < signal_cooldown_sec:
+            remaining = int(signal_cooldown_sec - (time.time() - last_signal_sent_ts))
+            logger.info("Signal cooldown active (%ss remaining). Skipping.", remaining)
+            continue
+
+        # News
         high_news = _safe_news_check(now_utc=now_utc, block_on_unknown_news=block_on_unknown_news)
 
         # Trend (H1)
@@ -332,12 +417,10 @@ def main() -> None:
                 )
             else:
                 logger.info("No clear H1 trend and no momentum override (ADX_M5=%.2f). Skipping.", adx_m5_last)
-                time.sleep(sleep_seconds)
                 continue
 
         if trend is None:
             logger.info("No clear trend. Skipping.")
-            time.sleep(sleep_seconds)
             continue
 
         signal = trigger_signal_m5(
@@ -356,16 +439,26 @@ def main() -> None:
         )
 
         if signal is None:
-            logger.info("No signal on candle close (session=%s). Sleeping %ss.", session, sleep_seconds)
-            time.sleep(sleep_seconds)
+            logger.info("No signal on candle close (session=%s).", session)
             continue
 
+        # ---- Compatibility + confidence scoring ----
         entry_score = int(signal.extra.get("entry_score", 0))
+
+        # Your MIN_ENTRY_SCORE is 65, so score is likely 0-100.
+        # If your strategy returns 0-10, adjust by exporting score scaled to 100 in strategy.
         confidence_text = "High" if entry_score >= 80 else "Moderate"
 
         note = f"Trend source: {trend_source}"
         if trend_source == "M5_MOMENTUM":
             note += f" | ADX_M5={adx_m5_last:.2f}"
+
+        # ✅ Fix: signal_formatter expects signal.price in your earlier logs
+        if not hasattr(signal, "price"):
+            try:
+                setattr(signal, "price", getattr(signal, "entry", None))
+            except Exception:
+                pass
 
         msg = build_signal_message(
             signal=signal,
@@ -377,12 +470,17 @@ def main() -> None:
 
         try:
             send_telegram_message(msg)
-            logger.info("Signal sent to Telegram: %s %s @ %.2f (score=%s)",
-                        signal.direction, symbol_label, signal.entry, entry_score)
+            last_signal_sent_ts = time.time()
+            last_signal_candle_time = eval_candle_time
+            logger.info(
+                "Signal sent to Telegram: %s %s @ %.2f (score=%s)",
+                getattr(signal, "direction", "UNKNOWN"),
+                symbol_label,
+                float(getattr(signal, "entry", 0.0) or 0.0),
+                entry_score,
+            )
         except Exception as e:
             logger.exception("Failed to send Telegram message: %s", e)
-
-        time.sleep(sleep_seconds)
 
 
 if __name__ == "__main__":
